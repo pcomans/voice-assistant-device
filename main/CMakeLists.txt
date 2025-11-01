@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "audio_controller.c"
+        "audio_playback.c"
+        "pcm_buffer.c"
+        "proxy_client.c"
+        "ui.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_event
+        esp_http_client
+        esp_netif
+        esp_wifi
+        esp_tls
+        cjson
+        lvgl
+        nvs_flash
+        esp_ringbuf
+        mbedtls
+)
