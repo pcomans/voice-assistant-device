@@ -3,6 +3,7 @@
 #include "audio_playback.h"
 #include "proxy_client.h"
 #include "ui.h"
+#include "wifi_credentials.h"
 
 #include <string.h>
 
@@ -43,8 +44,8 @@ static void initialise_wifi(void)
 
     wifi_config_t wifi_config = { 0 };
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    strncpy((char *)wifi_config.sta.ssid, "CHANGEME", sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password, "CHANGEME", sizeof(wifi_config.sta.password));
+    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));

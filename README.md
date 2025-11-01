@@ -15,4 +15,6 @@ idf.py build
 idf.py -p <PORT> flash monitor
 ```
 
+Copy `main/wifi_credentials.template.h` to `main/wifi_credentials.h` and populate your SSID/password before building.
+
 Populate Wi-Fi credentials and proxy configuration via NVS or a provisioning flow before flashing.
