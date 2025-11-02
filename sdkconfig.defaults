@@ -1,0 +1,9 @@
+# Partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Flash size
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Suppress legacy I2C driver warnings (will migrate later)
+CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y

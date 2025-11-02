@@ -12,6 +12,9 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lvgl.h"
 
 static const char *TAG = "smart_assistant";
 
@@ -92,6 +95,19 @@ static void ui_event_handler(const ui_event_t *event, void *ctx)
     }
 }
 
+static void lvgl_task(void *pvParameter)
+{
+    (void)pvParameter;
+
+    while (1) {
+        // Call LVGL task handler to process timers and render UI
+        lv_timer_handler();
+
+        // Delay for 10ms (LVGL recommends 5-20ms)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -102,4 +118,8 @@ void app_main(void)
     audio_playback_init();
     proxy_client_init();
     assistant_set_state(ASSISTANT_STATE_IDLE);
+
+    // Create LVGL task to periodically update the display
+    xTaskCreate(lvgl_task, "lvgl_task", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "LVGL task created");
 }

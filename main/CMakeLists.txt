@@ -6,17 +6,35 @@ idf_component_register(
         "pcm_buffer.c"
         "proxy_client.c"
         "ui.c"
+        "drivers/lcd/ST77916.c"
+        "drivers/lcd/esp_lcd_st77916/esp_lcd_st77916.c"
+        "drivers/touch/CST816.c"
+        "drivers/touch/esp_lcd_touch/esp_lcd_touch.c"
+        "drivers/i2c/I2C_Driver.c"
+        "drivers/exio/TCA9554PWR.c"
+        "drivers/lvgl/LVGL_Driver.c"
     INCLUDE_DIRS
         "."
+        "drivers/lcd"
+        "drivers/lcd/esp_lcd_st77916"
+        "drivers/touch"
+        "drivers/touch/esp_lcd_touch"
+        "drivers/i2c"
+        "drivers/exio"
+        "drivers/lvgl"
     REQUIRES
         esp_event
         esp_http_client
         esp_netif
         esp_wifi
-        esp_tls
-        cjson
-        lvgl
         nvs_flash
         esp_ringbuf
         mbedtls
+        esp_driver_i2s
+        esp_driver_gpio
+        esp_driver_spi
+        esp_driver_i2c
+        esp_driver_ledc
+        esp_lcd
+        driver
 )

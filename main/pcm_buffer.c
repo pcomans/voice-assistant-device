@@ -26,9 +26,10 @@ bool pcm_buffer_init(const pcm_buffer_config_t *cfg)
 
     s_ring = xRingbufferCreate(cfg->capacity_bytes, RINGBUF_TYPE_NOSPLIT);
     if (!s_ring) {
-        ESP_LOGE(PCM_BUFFER_TAG, "Failed to allocate ring buffer");
+        ESP_LOGE(PCM_BUFFER_TAG, "Failed to allocate ring buffer (capacity: %u bytes)", (unsigned int)cfg->capacity_bytes);
         return false;
     }
+    ESP_LOGI(PCM_BUFFER_TAG, "Ring buffer created: %u bytes", (unsigned int)cfg->capacity_bytes);
 
     s_bytes_per_sample = cfg->bytes_per_sample;
     s_capacity_bytes = cfg->capacity_bytes;
@@ -38,7 +39,12 @@ bool pcm_buffer_init(const pcm_buffer_config_t *cfg)
 void pcm_buffer_reset(void)
 {
     if (s_ring) {
-        xRingbufferReset(s_ring);
+        // Drain the ringbuffer by reading and discarding all items
+        size_t item_size;
+        void *item;
+        while ((item = xRingbufferReceive(s_ring, &item_size, 0)) != NULL) {
+            vRingbufferReturnItem(s_ring, item);
+        }
     }
 }
 

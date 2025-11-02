@@ -6,6 +6,7 @@
 
 #include "audio_playback.h"
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -101,7 +102,11 @@ static proxy_result_t perform_upload(void)
         return PROXY_RESULT_FAILED;
     }
 
-    uint8_t *pcm_data = malloc(bytes_available);
+    // Try SPIRAM first, fall back to internal RAM
+    uint8_t *pcm_data = heap_caps_malloc(bytes_available, MALLOC_CAP_SPIRAM);
+    if (!pcm_data) {
+        pcm_data = heap_caps_malloc(bytes_available, MALLOC_CAP_INTERNAL);
+    }
     if (!pcm_data) {
         ESP_LOGE(TAG, "Failed to allocate %u bytes for PCM copy", (unsigned int)bytes_available);
         return PROXY_RESULT_FAILED;
@@ -133,7 +138,7 @@ static proxy_result_t perform_upload(void)
     b64_output[b64_len] = '\0';
 
     char session_id[32];
-    snprintf(session_id, sizeof(session_id), "%08x", esp_random());
+    snprintf(session_id, sizeof(session_id), "%08lx", (unsigned long)esp_random());
 
     const char *payload_fmt = "{"
                               "\"session_id\":\"%s\","
@@ -238,7 +243,8 @@ void proxy_send_recording(proxy_result_cb_t cb, void *user_ctx)
     task_ctx->cb = cb;
     task_ctx->ctx = user_ctx;
 
-    if (xTaskCreatePinnedToCore(proxy_upload_task, "proxy_upload", 4096, task_ctx, 4, NULL, 1) != pdPASS) {
+    // Increase stack size to 8KB to handle large allocations
+    if (xTaskCreatePinnedToCore(proxy_upload_task, "proxy_upload", 8192, task_ctx, 4, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start proxy upload task");
         free(task_ctx);
         if (cb) {

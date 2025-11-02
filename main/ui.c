@@ -2,6 +2,9 @@
 
 #include "esp_log.h"
 #include "lvgl.h"
+#include <string.h>
+#include "ST77916.h"
+#include "LVGL_Driver.h"
 
 static const char *TAG = "ui";
 
@@ -29,6 +32,12 @@ void ui_init(ui_event_cb_t cb, void *user_ctx)
     s_event_cb = cb;
     s_event_ctx = user_ctx;
 
+    // Initialize LCD hardware and LVGL
+    LCD_Init();     // Initializes ST77916, backlight, and touch
+    LVGL_Init();    // Initializes LVGL with hardware display driver
+    ESP_LOGI(TAG, "LCD and LVGL initialized");
+
+    // Create UI elements
     lv_obj_t *screen = lv_scr_act();
     s_button = lv_btn_create(screen);
     lv_obj_center(s_button);
