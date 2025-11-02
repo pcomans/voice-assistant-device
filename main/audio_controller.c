@@ -11,13 +11,15 @@
 #define AUDIO_SAMPLE_RATE_HZ     16000
 #define AUDIO_BITS_PER_SAMPLE    I2S_DATA_BIT_WIDTH_32BIT  // MEMS mic outputs 32-bit I2S data
 #define AUDIO_CHANNEL_COUNT      1
-#define AUDIO_BUFFER_SECONDS     3  // Reduced from 5 to save memory
+#define AUDIO_BUFFER_SECONDS     10  // 10 seconds = 320KB (using SPIRAM)
 #define AUDIO_FRAME_SAMPLES      256
 
 static const char *TAG = "audio_ctrl";
 
 static TaskHandle_t capture_task_handle = NULL;
 static i2s_chan_handle_t s_rx_chan = NULL;
+static audio_capture_complete_cb_t s_capture_complete_cb = NULL;
+static void *s_capture_complete_ctx = NULL;
 
 static esp_err_t configure_i2s(void)
 {
@@ -84,7 +86,12 @@ static void capture_task(void *arg)
     int16_t pcm_buffer[AUDIO_FRAME_SAMPLES] = {0};
     const size_t i2s_bytes = sizeof(i2s_buffer);
 
-    ESP_LOGI(TAG, "Starting I2S read loop");
+    // Calculate max recording duration in bytes (10 seconds)
+    const size_t max_recording_bytes = AUDIO_SAMPLE_RATE_HZ * AUDIO_BUFFER_SECONDS * sizeof(int16_t);
+    size_t total_bytes_captured = 0;
+
+    ESP_LOGI(TAG, "Starting I2S read loop (max recording: %u bytes / %d seconds)",
+             (unsigned int)max_recording_bytes, AUDIO_BUFFER_SECONDS);
     size_t total_reads = 0;
 
     while (assistant_get_status().state == ASSISTANT_STATE_RECORDING) {
@@ -112,10 +119,25 @@ static void capture_task(void *arg)
             pcm_buffer[i] = (int16_t)(i2s_buffer[i] >> 14);
         }
 
-        pcm_buffer_push(pcm_buffer, sample_count);
+        size_t samples_pushed = pcm_buffer_push(pcm_buffer, sample_count);
+        total_bytes_captured += samples_pushed * sizeof(int16_t);
+
+        // Auto-stop after 10 seconds
+        if (total_bytes_captured >= max_recording_bytes) {
+            ESP_LOGI(TAG, "Recording limit reached (%u bytes / %d seconds), auto-stopping",
+                     (unsigned int)total_bytes_captured, AUDIO_BUFFER_SECONDS);
+            assistant_set_state(ASSISTANT_STATE_IDLE);
+
+            // Notify that recording completed via auto-stop
+            if (s_capture_complete_cb) {
+                s_capture_complete_cb(s_capture_complete_ctx);
+            }
+            break;
+        }
     }
 
-    ESP_LOGI(TAG, "Capture task exit (total reads: %u)", (unsigned int)total_reads);
+    ESP_LOGI(TAG, "Capture task exit (total reads: %u, total bytes: %u)",
+             (unsigned int)total_reads, (unsigned int)total_bytes_captured);
     capture_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -163,4 +185,10 @@ void audio_stop_capture(void)
     }
     ESP_LOGI(TAG, "Stopping capture");
     // The task checks the state and exits.
+}
+
+void audio_set_capture_complete_callback(audio_capture_complete_cb_t callback, void *ctx)
+{
+    s_capture_complete_cb = callback;
+    s_capture_complete_ctx = ctx;
 }

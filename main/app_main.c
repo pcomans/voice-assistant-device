@@ -20,8 +20,41 @@ static const char *TAG = "smart_assistant";
 
 static assistant_status_t g_status = {
     .state = ASSISTANT_STATE_IDLE,
+    .wifi_connected = false,
     .proxy_connected = false,
 };
+
+// Forward declarations
+static void command_callback(proxy_result_t result, void *user_ctx);
+
+static void playback_event_handler(audio_playback_event_t event, void *ctx)
+{
+    (void)ctx;
+
+    switch (event) {
+    case AUDIO_PLAYBACK_EVENT_STARTED:
+        ESP_LOGI(TAG, "Playback started");
+        break;
+    case AUDIO_PLAYBACK_EVENT_COMPLETED:
+        ESP_LOGI(TAG, "Playback completed");
+        assistant_set_state(ASSISTANT_STATE_IDLE);
+        break;
+    case AUDIO_PLAYBACK_EVENT_ERROR:
+        ESP_LOGE(TAG, "Playback error");
+        assistant_set_state(ASSISTANT_STATE_ERROR);
+        break;
+    }
+}
+
+static void capture_complete_handler(void *ctx)
+{
+    (void)ctx;
+    ESP_LOGI(TAG, "Auto-stop triggered, sending recording to proxy");
+
+    // When auto-stop occurs, send recording to proxy
+    assistant_set_state(ASSISTANT_STATE_SENDING);
+    proxy_send_recording(command_callback, NULL);
+}
 
 assistant_status_t assistant_get_status(void)
 {
@@ -36,11 +69,41 @@ void assistant_set_state(assistant_state_t new_state)
     }
 }
 
+void assistant_set_wifi_connected(bool connected)
+{
+    if (g_status.wifi_connected != connected) {
+        g_status.wifi_connected = connected;
+        ui_update_state(g_status);
+        ESP_LOGI(TAG, "Wi-Fi %s", connected ? "connected" : "disconnected");
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "Wi-Fi connecting...");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        assistant_set_wifi_connected(false);
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "Reconnecting to Wi-Fi...");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        assistant_set_wifi_connected(true);
+    }
+}
+
 static void initialise_wifi(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+
+    // Register event handlers
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -77,6 +140,10 @@ static void ui_event_handler(const ui_event_t *event, void *ctx)
 
     switch (event->type) {
     case UI_EVENT_RECORD_START:
+        if (!assistant_get_status().wifi_connected) {
+            ESP_LOGW(TAG, "Cannot start recording: Wi-Fi not connected");
+            break;
+        }
         if (assistant_get_status().state == ASSISTANT_STATE_IDLE) {
             assistant_set_state(ASSISTANT_STATE_RECORDING);
             audio_start_capture();
@@ -116,6 +183,8 @@ void app_main(void)
     ui_init(ui_event_handler, NULL);
     audio_controller_init();
     audio_playback_init();
+    audio_playback_set_callback(playback_event_handler, NULL);
+    audio_set_capture_complete_callback(capture_complete_handler, NULL);
     proxy_client_init();
     assistant_set_state(ASSISTANT_STATE_IDLE);
 

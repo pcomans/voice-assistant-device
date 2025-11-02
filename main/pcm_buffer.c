@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
@@ -9,6 +10,8 @@
 #define PCM_BUFFER_TAG "pcm_buffer"
 
 static RingbufHandle_t s_ring = NULL;
+static uint8_t *s_ring_storage = NULL;
+static StaticRingbuffer_t *s_ring_struct = NULL;
 static size_t s_bytes_per_sample = 0;
 static size_t s_capacity_bytes = 0;
 
@@ -19,17 +22,57 @@ bool pcm_buffer_init(const pcm_buffer_config_t *cfg)
         return false;
     }
 
+    // Clean up existing buffer
     if (s_ring) {
         vRingbufferDelete(s_ring);
         s_ring = NULL;
     }
+    if (s_ring_storage) {
+        free(s_ring_storage);
+        s_ring_storage = NULL;
+    }
+    if (s_ring_struct) {
+        free(s_ring_struct);
+        s_ring_struct = NULL;
+    }
 
-    s_ring = xRingbufferCreate(cfg->capacity_bytes, RINGBUF_TYPE_NOSPLIT);
-    if (!s_ring) {
-        ESP_LOGE(PCM_BUFFER_TAG, "Failed to allocate ring buffer (capacity: %u bytes)", (unsigned int)cfg->capacity_bytes);
+    // Allocate static ring buffer from SPIRAM
+    // For BYTEBUF type, storage size equals buffer capacity
+    size_t ring_storage_size = cfg->capacity_bytes;
+
+    // Log available SPIRAM
+    size_t spiram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(PCM_BUFFER_TAG, "Attempting to allocate %u bytes, SPIRAM available: %u bytes",
+             (unsigned int)ring_storage_size, (unsigned int)spiram_free);
+
+    // Large ring buffer - must use SPIRAM
+    s_ring_storage = heap_caps_malloc(ring_storage_size, MALLOC_CAP_SPIRAM);
+    if (!s_ring_storage) {
+        ESP_LOGE(PCM_BUFFER_TAG, "Failed to allocate %u bytes from SPIRAM for ring buffer storage", (unsigned int)ring_storage_size);
         return false;
     }
-    ESP_LOGI(PCM_BUFFER_TAG, "Ring buffer created: %u bytes", (unsigned int)cfg->capacity_bytes);
+    ESP_LOGI(PCM_BUFFER_TAG, "Allocated %u bytes for ring buffer storage", (unsigned int)ring_storage_size);
+
+    s_ring_struct = heap_caps_malloc(sizeof(StaticRingbuffer_t), MALLOC_CAP_INTERNAL);
+    if (!s_ring_struct) {
+        ESP_LOGE(PCM_BUFFER_TAG, "Failed to allocate ring buffer struct");
+        free(s_ring_storage);
+        s_ring_storage = NULL;
+        return false;
+    }
+
+    s_ring = xRingbufferCreateStatic(cfg->capacity_bytes, RINGBUF_TYPE_BYTEBUF, s_ring_storage, s_ring_struct);
+    if (!s_ring) {
+        ESP_LOGE(PCM_BUFFER_TAG, "Failed to create static ring buffer");
+        free(s_ring_storage);
+        free(s_ring_struct);
+        s_ring_storage = NULL;
+        s_ring_struct = NULL;
+        return false;
+    }
+
+    ESP_LOGI(PCM_BUFFER_TAG, "Ring buffer created (BYTEBUF): %u bytes (storage: %u bytes, in SPIRAM)",
+             (unsigned int)cfg->capacity_bytes, (unsigned int)ring_storage_size);
 
     s_bytes_per_sample = cfg->bytes_per_sample;
     s_capacity_bytes = cfg->capacity_bytes;
