@@ -6,6 +6,7 @@
 
 #include "audio_playback.h"
 #include "cJSON.h"
+#include "decoder/impl/esp_opus_dec.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -147,41 +148,207 @@ static proxy_result_t handle_response_body(const char *body)
         return PROXY_RESULT_FAILED;
     }
 
+    // Feed watchdog before parsing large JSON
+    vTaskDelay(1);
+
     cJSON *root = cJSON_Parse(body);
     if (!root) {
-        ESP_LOGE(TAG, "Failed to parse proxy response JSON: %s", body);
+        ESP_LOGE(TAG, "Failed to parse proxy response JSON (first 200 chars): %.200s", body);
         return PROXY_RESULT_FAILED;
     }
 
-    proxy_result_t result = PROXY_RESULT_OK;
+    // Feed watchdog after parsing
+    vTaskDelay(1);
 
-    const cJSON *transcript = cJSON_GetObjectItemCaseSensitive(root, "transcript");
-    if (cJSON_IsString(transcript) && transcript->valuestring) {
-        ESP_LOGI(TAG, "Proxy transcript: %s", transcript->valuestring);
-    }
+    proxy_result_t result = PROXY_RESULT_OK;
 
     const cJSON *audio_b64 = cJSON_GetObjectItemCaseSensitive(root, "audio_base64");
     if (cJSON_IsString(audio_b64) && audio_b64->valuestring && audio_b64->valuestring[0] != '\0') {
         const char *audio_str = audio_b64->valuestring;
-        size_t input_len = strlen(audio_str);
-        size_t decoded_len = 0;
+        size_t b64_len = strlen(audio_str);
+        size_t opus_len = 0;
 
-        uint8_t *decoded = proxy_alloc(input_len);
-        if (!decoded) {
-            ESP_LOGE(TAG, "Failed to allocate buffer for audio decode");
+        // Decode base64 to get Opus-encoded audio
+        uint8_t *opus_data = proxy_alloc(b64_len);
+        if (!opus_data) {
+            ESP_LOGE(TAG, "Failed to allocate buffer for base64 decode");
             result = PROXY_RESULT_FAILED;
         } else {
-            int rc = mbedtls_base64_decode(decoded, input_len, &decoded_len,
-                                           (const unsigned char *)audio_str, input_len);
+            int rc = mbedtls_base64_decode(opus_data, b64_len, &opus_len,
+                                           (const unsigned char *)audio_str, b64_len);
             if (rc != 0) {
-                ESP_LOGE(TAG, "Audio base64 decode failed: %d", rc);
+                ESP_LOGE(TAG, "Base64 decode failed: %d", rc);
                 result = PROXY_RESULT_FAILED;
+                proxy_free(opus_data);
             } else {
-                assistant_set_state(ASSISTANT_STATE_PLAYING);
-                audio_playback_play_pcm(decoded, decoded_len);
-                result = PROXY_RESULT_OK;
+                ESP_LOGI(TAG, "Decoded %zu bytes of Opus audio data", opus_len);
+
+                // Initialize Opus decoder (24kHz, mono, 20ms frames)
+                esp_opus_dec_cfg_t opus_cfg = {
+                    .sample_rate = 24000,  // OpenAI outputs 24kHz
+                    .channel = 1,          // Mono
+                    .frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS,  // Python encodes 20ms frames
+                    .self_delimited = false,  // We manually parse RFC 6716 Appendix B length prefix
+                };
+
+                void *opus_handle = NULL;
+                rc = esp_opus_dec_open(&opus_cfg, sizeof(opus_cfg), &opus_handle);
+                if (rc != ESP_AUDIO_ERR_OK) {
+                    ESP_LOGE(TAG, "Failed to open Opus decoder: %d", rc);
+                    result = PROXY_RESULT_FAILED;
+                    proxy_free(opus_data);
+                } else {
+                    // Start with initial PCM buffer estimate (opus_len * 10 is typical)
+                    size_t pcm_capacity = opus_len * 10;
+                    uint8_t *pcm_data = proxy_alloc(pcm_capacity);
+                    if (!pcm_data) {
+                        ESP_LOGE(TAG, "Failed to allocate PCM output buffer");
+                        esp_opus_dec_close(opus_handle);
+                        proxy_free(opus_data);
+                        result = PROXY_RESULT_FAILED;
+                    } else {
+                        // Allocate frame buffer for decoder (reused for each frame)
+                        size_t frame_buf_size = 24000 * 2 * 0.12;  // 24kHz * 16-bit * 120ms
+                        uint8_t *frame_buf = proxy_alloc(frame_buf_size);
+                        if (!frame_buf) {
+                            ESP_LOGE(TAG, "Failed to allocate frame buffer");
+                            proxy_free(pcm_data);
+                            esp_opus_dec_close(opus_handle);
+                            proxy_free(opus_data);
+                            result = PROXY_RESULT_FAILED;
+                        } else {
+                            // Decode Opus to PCM
+                            esp_audio_dec_in_raw_t raw = {
+                                .buffer = opus_data,
+                                .len = opus_len,
+                                .consumed = 0,
+                            };
+
+                            esp_audio_dec_out_frame_t frame = {
+                                .buffer = frame_buf,
+                                .len = frame_buf_size,
+                                .decoded_size = 0,
+                            };
+
+                            esp_audio_dec_info_t dec_info = {0};
+
+                            // Decode all Opus frames, collecting into pcm_data
+                            // Manually parse self-delimited frames (RFC 6716 Appendix B)
+                            size_t total_pcm = 0;
+                            int frame_count = 0;
+                            size_t offset = 0;
+                            ESP_LOGI(TAG, "Starting Opus decode loop with %zu bytes", opus_len);
+
+                            while (offset < opus_len) {
+                                vTaskDelay(1);  // Feed watchdog
+
+                                // Parse self-delimited length prefix
+                                if (offset >= opus_len) break;
+                                uint8_t first_byte = opus_data[offset];
+                                size_t frame_len;
+                                size_t header_len;
+
+                                if (first_byte < 252) {
+                                    // Single byte length
+                                    frame_len = first_byte;
+                                    header_len = 1;
+                                } else {
+                                    // Two byte length: 252 + second byte
+                                    if (offset + 1 >= opus_len) {
+                                        ESP_LOGE(TAG, "Truncated length header at offset %zu", offset);
+                                        break;
+                                    }
+                                    frame_len = 252 + opus_data[offset + 1];
+                                    header_len = 2;
+                                }
+
+                                if (offset + header_len + frame_len > opus_len) {
+                                    ESP_LOGE(TAG, "Frame %d extends beyond buffer: offset=%zu, header=%zu, frame=%zu, total=%zu",
+                                             frame_count, offset, header_len, frame_len, opus_len);
+                                    break;
+                                }
+
+                                // Setup decoder input for this frame (skip length prefix)
+                                raw.buffer = opus_data + offset + header_len;
+                                raw.len = frame_len;
+
+                                rc = esp_opus_dec_decode(opus_handle, &raw, &frame, &dec_info);
+                                ESP_LOGI(TAG, "Frame %d: len=%zu, rc=%d, decoded=%u",
+                                         frame_count, frame_len, rc, frame.decoded_size);
+
+                                if (rc == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                                    // Need larger frame buffer
+                                    ESP_LOGW(TAG, "Frame buffer too small, need %u bytes", frame.needed_size);
+                                    uint8_t *new_frame_buf = proxy_alloc(frame.needed_size);
+                                    if (!new_frame_buf) {
+                                        ESP_LOGE(TAG, "Failed to reallocate frame buffer");
+                                        break;
+                                    }
+                                    proxy_free(frame_buf);
+                                    frame_buf = new_frame_buf;
+                                    frame.buffer = frame_buf;
+                                    frame.len = frame.needed_size;
+                                    frame_buf_size = frame.needed_size;
+                                    continue;
+                                } else if (rc != ESP_AUDIO_ERR_OK) {
+                                    ESP_LOGE(TAG, "Opus decode failed: %d", rc);
+                                    break;
+                                }
+
+                                if (frame.decoded_size == 0) {
+                                    ESP_LOGW(TAG, "Decoded 0 bytes, stopping decode loop");
+                                    break;
+                                }
+
+                                // Check if we need to grow the output buffer
+                                if (total_pcm + frame.decoded_size > pcm_capacity) {
+                                    size_t new_capacity = pcm_capacity * 2;
+                                    uint8_t *new_buf = proxy_alloc(new_capacity);
+                                    if (!new_buf) {
+                                        ESP_LOGE(TAG, "Failed to reallocate PCM buffer to %zu bytes", new_capacity);
+                                        break;
+                                    }
+                                    memcpy(new_buf, pcm_data, total_pcm);
+                                    proxy_free(pcm_data);
+                                    pcm_data = new_buf;
+                                    pcm_capacity = new_capacity;
+                                    ESP_LOGD(TAG, "Expanded PCM buffer to %zu bytes", new_capacity);
+                                }
+
+                                // Copy this frame's decoded data to output buffer
+                                memcpy(pcm_data + total_pcm, frame.buffer, frame.decoded_size);
+                                total_pcm += frame.decoded_size;
+                                frame_count++;
+
+                                // Move to next self-delimited frame
+                                offset += header_len + frame_len;
+
+                                // Reset for next frame
+                                frame.decoded_size = 0;
+                            }
+
+                            ESP_LOGI(TAG, "Decode loop complete: %d frames, %zu total PCM bytes", frame_count, total_pcm);
+
+                            proxy_free(frame_buf);
+
+                            if (total_pcm > 0) {
+                                ESP_LOGI(TAG, "Decoded %zu bytes of PCM audio (24kHz mono)", total_pcm);
+                                assistant_set_state(ASSISTANT_STATE_PLAYING);
+                                audio_playback_play_pcm(pcm_data, total_pcm);
+                                result = PROXY_RESULT_OK;
+                            } else {
+                                ESP_LOGE(TAG, "No PCM audio decoded");
+                                result = PROXY_RESULT_FAILED;
+                            }
+
+                            proxy_free(pcm_data);
+                        }
+                    }
+
+                    esp_opus_dec_close(opus_handle);
+                    proxy_free(opus_data);
+                }
             }
-            proxy_free(decoded);
         }
     } else {
         ESP_LOGW(TAG, "Proxy response missing audio payload");
@@ -353,9 +520,9 @@ void proxy_send_recording(proxy_result_cb_t cb, void *user_ctx)
     task_ctx->cb = cb;
     task_ctx->ctx = user_ctx;
 
-    // Increase stack size to 8KB to handle large allocations
+    // Increase stack size to 24KB to handle Opus decoder (ESP audio codec docs recommend 20KB for decoders)
     // Pin to core 0 to avoid contention with audio playback on core 1
-    if (xTaskCreatePinnedToCore(proxy_upload_task, "proxy_upload", 8192, task_ctx, 4, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(proxy_upload_task, "proxy_upload", 24576, task_ctx, 4, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start proxy upload task");
         free(task_ctx);
         if (cb) {

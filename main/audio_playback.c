@@ -10,7 +10,7 @@
 #include "freertos/task.h"
 
 #define PLAYBACK_I2S_PORT      I2S_NUM_0
-#define PLAYBACK_SAMPLE_RATE   16000
+#define PLAYBACK_SAMPLE_RATE   24000  // Match OpenAI Realtime API output
 #define PLAYBACK_DATA_WIDTH    I2S_DATA_BIT_WIDTH_16BIT
 
 #define PLAYBACK_GPIO_BCLK     GPIO_NUM_48
