@@ -271,10 +271,14 @@ static proxy_result_t handle_response_body(const char *body)
                                 // Setup decoder input for this frame (skip length prefix)
                                 raw.buffer = opus_data + offset + header_len;
                                 raw.len = frame_len;
+                                raw.consumed = 0;
+
+                                ESP_LOGI(TAG, "Frame %d: Calling decoder with offset=%zu, header=%zu, frame_len=%zu",
+                                         frame_count, offset, header_len, frame_len);
 
                                 rc = esp_opus_dec_decode(opus_handle, &raw, &frame, &dec_info);
-                                ESP_LOGI(TAG, "Frame %d: len=%zu, rc=%d, decoded=%u",
-                                         frame_count, frame_len, rc, frame.decoded_size);
+                                ESP_LOGI(TAG, "Frame %d: rc=%d, decoded=%u, consumed=%u",
+                                         frame_count, rc, frame.decoded_size, raw.consumed);
 
                                 if (rc == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
                                     // Need larger frame buffer
