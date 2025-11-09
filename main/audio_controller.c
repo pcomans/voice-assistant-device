@@ -13,13 +13,17 @@
 #define AUDIO_CHANNEL_COUNT      1
 #define AUDIO_BUFFER_SECONDS     10  // 10 seconds = 320KB (using SPIRAM)
 #define AUDIO_FRAME_SAMPLES      256
+#define STREAMING_CHUNK_MS       100  // Send 100ms chunks for streaming
 
 static const char *TAG = "audio_ctrl";
 
 static TaskHandle_t capture_task_handle = NULL;
+static TaskHandle_t streaming_capture_task_handle = NULL;
 static i2s_chan_handle_t s_rx_chan = NULL;
 static audio_capture_complete_cb_t s_capture_complete_cb = NULL;
 static void *s_capture_complete_ctx = NULL;
+static audio_capture_chunk_cb_t s_chunk_cb = NULL;
+static void *s_chunk_ctx = NULL;
 
 static esp_err_t configure_i2s(void)
 {
@@ -191,4 +195,110 @@ void audio_set_capture_complete_callback(audio_capture_complete_cb_t callback, v
 {
     s_capture_complete_cb = callback;
     s_capture_complete_ctx = ctx;
+}
+
+static void streaming_capture_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Streaming capture task started");
+
+    if (!s_rx_chan) {
+        ESP_LOGE(TAG, "I2S channel is NULL!");
+        streaming_capture_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Calculate chunk size for 100ms at 16kHz, 16-bit PCM
+    const size_t chunk_samples = (AUDIO_SAMPLE_RATE_HZ * STREAMING_CHUNK_MS) / 1000;
+    const size_t chunk_bytes = chunk_samples * sizeof(int16_t);  // 3200 bytes for 100ms
+
+    // Buffers for I2S and PCM conversion
+    int32_t *i2s_buffer = malloc(chunk_samples * sizeof(int32_t));
+    int16_t *pcm_chunk = malloc(chunk_bytes);
+
+    if (!i2s_buffer || !pcm_chunk) {
+        ESP_LOGE(TAG, "Failed to allocate streaming buffers");
+        if (i2s_buffer) free(i2s_buffer);
+        if (pcm_chunk) free(pcm_chunk);
+        streaming_capture_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t samples_in_chunk = 0;
+    int frames_read = 0;
+
+    while (assistant_get_status().state == ASSISTANT_STATE_RECORDING) {
+        // Read I2S data in smaller frames
+        size_t bytes_read = 0;
+        size_t i2s_bytes = AUDIO_FRAME_SAMPLES * sizeof(int32_t);
+        esp_err_t err = i2s_channel_read(s_rx_chan, i2s_buffer, i2s_bytes, &bytes_read, portMAX_DELAY);
+
+        if (err != ESP_OK || bytes_read == 0) {
+            ESP_LOGW(TAG, "I2S read error or empty: %d", err);
+            continue;
+        }
+
+        frames_read++;
+
+        // Convert 32-bit I2S to 16-bit PCM
+        size_t samples_read = bytes_read / sizeof(int32_t);
+        for (size_t i = 0; i < samples_read; i++) {
+            if (samples_in_chunk < chunk_samples) {
+                pcm_chunk[samples_in_chunk++] = (int16_t)(i2s_buffer[i] >> 14);
+            }
+        }
+
+        // When chunk is full, send it via callback
+        if (samples_in_chunk >= chunk_samples) {
+            if (s_chunk_cb) {
+                s_chunk_cb((const uint8_t *)pcm_chunk, chunk_bytes, s_chunk_ctx);
+            }
+            samples_in_chunk = 0;  // Reset for next chunk
+        }
+    }
+
+    // ALWAYS send a final chunk (even if empty) to signal end of recording
+    // The handler uses state change to detect this is the final chunk
+    if (s_chunk_cb) {
+        size_t remaining_bytes = samples_in_chunk * sizeof(int16_t);
+        if (remaining_bytes > 0) {
+            ESP_LOGI(TAG, "Sending final partial chunk: %zu samples (%zu bytes)", samples_in_chunk, remaining_bytes);
+        } else {
+            ESP_LOGI(TAG, "Sending final empty chunk to signal end of recording");
+        }
+        s_chunk_cb((const uint8_t *)pcm_chunk, remaining_bytes, s_chunk_ctx);
+    }
+
+    free(i2s_buffer);
+    free(pcm_chunk);
+
+    ESP_LOGI(TAG, "Streaming capture task exit (frames read: %d)", frames_read);
+    streaming_capture_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+void audio_start_streaming_capture(audio_capture_chunk_cb_t chunk_cb, void *ctx)
+{
+    if (streaming_capture_task_handle) {
+        ESP_LOGW(TAG, "Streaming capture already running");
+        return;
+    }
+
+    s_chunk_cb = chunk_cb;
+    s_chunk_ctx = ctx;
+
+    ESP_LOGI(TAG, "Starting streaming audio capture (100ms chunks)");
+    xTaskCreatePinnedToCore(streaming_capture_task, "audio_stream", 4096, NULL, 5, &streaming_capture_task_handle, 0);
+}
+
+void audio_stop_streaming_capture(void)
+{
+    if (!streaming_capture_task_handle) {
+        ESP_LOGW(TAG, "Streaming capture not running");
+        return;
+    }
+    ESP_LOGI(TAG, "Stopping streaming capture");
+    // The task checks the state and exits
 }

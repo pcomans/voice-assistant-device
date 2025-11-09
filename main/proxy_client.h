@@ -15,6 +15,9 @@ typedef void (*proxy_result_cb_t)(proxy_result_t result, void *user_ctx);
 void proxy_client_init(void);
 void proxy_send_recording(proxy_result_cb_t cb, void *user_ctx);
 
+// Get persistent session ID (loaded from NVS, persists across reboots)
+const char *proxy_get_session_id(void);
+
 // Chunked streaming API (Option C)
 typedef void *proxy_stream_handle_t;
 

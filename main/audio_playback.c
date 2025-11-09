@@ -24,6 +24,7 @@ static TaskHandle_t s_playback_task = NULL;
 static audio_playback_callback_t s_callback = NULL;
 static void *s_callback_ctx = NULL;
 static uint8_t s_volume = 100;  // Default volume 100%
+static bool s_streaming_active = false;
 
 typedef struct {
     uint8_t *data;
@@ -204,5 +205,89 @@ void audio_playback_stop(void)
         vTaskDelete(s_playback_task);
         s_playback_task = NULL;
         ESP_LOGI(TAG, "Playback stopped");
+    }
+    s_streaming_active = false;
+}
+
+// Streaming playback API for immediate, low-latency playback
+bool audio_playback_stream_start(void)
+{
+    if (!s_tx_chan) {
+        ESP_LOGW(TAG, "Playback channel not initialised");
+        return false;
+    }
+    if (s_playback_task) {
+        ESP_LOGW(TAG, "Buffered playback in progress, cannot start streaming");
+        return false;
+    }
+    if (s_streaming_active) {
+        ESP_LOGW(TAG, "Streaming playback already active");
+        return false;
+    }
+
+    s_streaming_active = true;
+    ESP_LOGI(TAG, "Streaming playback started");
+
+    if (s_callback) {
+        s_callback(AUDIO_PLAYBACK_EVENT_STARTED, s_callback_ctx);
+    }
+
+    return true;
+}
+
+bool audio_playback_stream_write(const uint8_t *data, size_t length_bytes)
+{
+    if (!s_streaming_active) {
+        ESP_LOGW(TAG, "Streaming not active, call audio_playback_stream_start() first");
+        return false;
+    }
+    if (!data || length_bytes == 0) {
+        return true;  // Empty chunk, skip
+    }
+
+    // For streaming, apply volume and write directly to I2S (no buffering)
+    // Allocate temp buffer for volume adjustment if needed
+    uint8_t *write_data = (uint8_t *)data;
+    uint8_t *volume_buffer = NULL;
+
+    if (s_volume != 100) {
+        volume_buffer = malloc(length_bytes);
+        if (volume_buffer) {
+            memcpy(volume_buffer, data, length_bytes);
+            size_t num_samples = length_bytes / sizeof(int16_t);
+            apply_volume((int16_t *)volume_buffer, num_samples, s_volume);
+            write_data = volume_buffer;
+        } else {
+            ESP_LOGW(TAG, "Failed to allocate volume buffer, playing at original volume");
+        }
+    }
+
+    size_t bytes_written = 0;
+    esp_err_t err = i2s_channel_write(s_tx_chan, write_data, length_bytes, &bytes_written, portMAX_DELAY);
+
+    if (volume_buffer) {
+        free(volume_buffer);
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Streaming I2S write failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGD(TAG, "Streamed %zu bytes to I2S", bytes_written);
+    return true;
+}
+
+void audio_playback_stream_end(void)
+{
+    if (!s_streaming_active) {
+        return;
+    }
+
+    s_streaming_active = false;
+    ESP_LOGI(TAG, "Streaming playback ended");
+
+    if (s_callback) {
+        s_callback(AUDIO_PLAYBACK_EVENT_COMPLETED, s_callback_ctx);
     }
 }

@@ -14,6 +14,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include "pcm_buffer.h"
 #include "smart_assistant.h"
@@ -23,6 +25,10 @@ static const char *TAG = "proxy_client";
 #define PROXY_DEFAULT_URL   "http://192.168.7.75:8000/v1/audio"
 #define PROXY_DEFAULT_TOKEN "498b1b65-26a3-49e8-a55e-46a0b47365e2"
 
+// NVS keys for persistent session ID
+#define NVS_NAMESPACE       "proxy_client"
+#define NVS_SESSION_ID_KEY  "session_id"
+
 // Response buffer limits
 #define MAX_RESPONSE_SIZE        (4 * 1024 * 1024)  // 4MB max response
 #define INITIAL_RESPONSE_BUFFER  4096               // Initial buffer for unknown size
@@ -31,11 +37,15 @@ static const char *TAG = "proxy_client";
 typedef struct {
     char url[128];
     char token[64];
+    char session_id[32];  // Persistent session ID
+    bool session_id_loaded;
 } proxy_config_t;
 
 static proxy_config_t s_config = {
     .url = PROXY_DEFAULT_URL,
     .token = PROXY_DEFAULT_TOKEN,
+    .session_id = {0},
+    .session_id_loaded = false,
 };
 
 typedef struct {
@@ -59,10 +69,63 @@ static void proxy_free(void *ptr)
     }
 }
 
+static void load_or_create_session_id(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS namespace: %s", esp_err_to_name(err));
+        goto generate_new;
+    }
+
+    // Try to load existing session ID
+    size_t session_id_len = sizeof(s_config.session_id);
+    err = nvs_get_str(nvs_handle, NVS_SESSION_ID_KEY, s_config.session_id, &session_id_len);
+    if (err == ESP_OK && session_id_len > 0) {
+        ESP_LOGI(TAG, "Loaded persistent session ID: %s", s_config.session_id);
+        s_config.session_id_loaded = true;
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    // Generate new session ID if not found
+    ESP_LOGI(TAG, "No session ID found, generating new one");
+
+generate_new:
+    snprintf(s_config.session_id, sizeof(s_config.session_id), "esp32-%08lx", (unsigned long)esp_random());
+    ESP_LOGI(TAG, "Generated new session ID: %s", s_config.session_id);
+
+    // Save to NVS
+    if (err == ESP_OK) {  // NVS handle is still open
+        err = nvs_set_str(nvs_handle, NVS_SESSION_ID_KEY, s_config.session_id);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs_handle);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Saved session ID to NVS");
+            } else {
+                ESP_LOGW(TAG, "Failed to commit session ID to NVS: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGW(TAG, "Failed to save session ID to NVS: %s", esp_err_to_name(err));
+        }
+        nvs_close(nvs_handle);
+    }
+    s_config.session_id_loaded = true;
+}
+
 void proxy_client_init(void)
 {
-    ESP_LOGI(TAG, "Proxy client initialised using %s", s_config.url);
+    load_or_create_session_id();
+    ESP_LOGI(TAG, "Proxy client initialised using %s (session: %s)", s_config.url, s_config.session_id);
     // TODO: load proxy URL/token from NVS, warm up TLS credentials.
+}
+
+const char *proxy_get_session_id(void)
+{
+    if (!s_config.session_id_loaded) {
+        load_or_create_session_id();
+    }
+    return s_config.session_id;
 }
 
 // Helper function to read HTTP response body into a dynamically sized buffer
@@ -657,80 +720,243 @@ typedef struct {
 static void proxy_stream_end_task(void *arg)
 {
     proxy_stream_end_task_ctx_t *task_ctx = (proxy_stream_end_task_ctx_t *)arg;
-
-    // TODO: Implement streaming response handling
-    // For now, use same approach as proxy_send_recording but with chunk_index parameter
-
     proxy_result_t result = PROXY_RESULT_FAILED;
 
-    // Send final chunk
-    // Base64 encode
+    // Base64 encode final chunk
     size_t b64_len = 0;
     size_t b64_buff_len = ((task_ctx->pcm_len + 2) / 3) * 4 + 1;
     char *b64_output = proxy_alloc(b64_buff_len);
-    if (b64_output) {
-        int rc = mbedtls_base64_encode((unsigned char *)b64_output, b64_buff_len, &b64_len,
-                                      task_ctx->pcm_data, task_ctx->pcm_len);
-        if (rc == 0) {
-            b64_output[b64_len] = '\0';
-
-            // Build JSON payload
-            const char *payload_fmt = "{"
-                                      "\"session_id\":\"%s\","
-                                      "\"chunk_index\":%d,"
-                                      "\"pcm_base64\":\"%s\","
-                                      "\"is_final\":true"
-                                      "}";
-            const size_t payload_len = strlen(payload_fmt) + strlen(task_ctx->stream_ctx->session_id) + 20 + b64_len + 1;
-            char *payload = proxy_alloc(payload_len);
-            if (payload) {
-                snprintf(payload, payload_len, payload_fmt, task_ctx->stream_ctx->session_id, task_ctx->chunk_index, b64_output);
-
-                ESP_LOGI(TAG, "Sending final chunk %d (%zu bytes PCM)", task_ctx->chunk_index, task_ctx->pcm_len);
-
-                esp_http_client_config_t config = {
-                    .url = s_config.url,
-                    .method = HTTP_METHOD_POST,
-                    .timeout_ms = 30000,  // Longer timeout for final chunk
-                };
-
-                esp_http_client_handle_t client = esp_http_client_init(&config);
-                if (client) {
-                    esp_http_client_set_header(client, "Content-Type", "application/json");
-                    esp_http_client_set_header(client, "X-Assistant-Token", s_config.token);
-
-                    esp_err_t err = esp_http_client_open(client, strlen(payload));
-                    if (err == ESP_OK) {
-                        int wlen = esp_http_client_write(client, payload, strlen(payload));
-                        if (wlen >= 0) {
-                            int64_t content_length = esp_http_client_fetch_headers(client);
-                            int status = esp_http_client_get_status_code(client);
-                            ESP_LOGI(TAG, "Final chunk response: status=%d, content_length=%lld", status, content_length);
-
-                            if (status == 200) {
-                                size_t response_len = 0;
-                                char *response_body = read_response_body(client, content_length, &response_len);
-
-                                if (response_body && response_len > 0) {
-                                    ESP_LOGI(TAG, "Received streaming response (%zu bytes)", response_len);
-                                    result = handle_response_body(response_body);
-                                    proxy_free(response_body);
-                                } else {
-                                    ESP_LOGW(TAG, "Empty streaming response");
-                                }
-                            }
-                        }
-                        esp_http_client_close(client);
-                    }
-                    esp_http_client_cleanup(client);
-                }
-                proxy_free(payload);
-            }
-            proxy_free(b64_output);
-        }
+    if (!b64_output) {
+        ESP_LOGE(TAG, "Failed to allocate base64 buffer for final chunk");
+        goto cleanup;
     }
 
-    // Clean up
+    int rc = mbedtls_base64_encode((unsigned char *)b64_output, b64_buff_len, &b64_len,
+                                  task_ctx->pcm_data, task_ctx->pcm_len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Base64 encode failed for final chunk: %d", rc);
+        proxy_free(b64_output);
+        goto cleanup;
+    }
+    b64_output[b64_len] = '\0';
+
+    // Build JSON payload
+    const char *payload_fmt = "{"
+                              "\"session_id\":\"%s\","
+                              "\"chunk_index\":%d,"
+                              "\"pcm_base64\":\"%s\","
+                              "\"is_final\":true"
+                              "}";
+    const size_t payload_len = strlen(payload_fmt) + strlen(task_ctx->stream_ctx->session_id) + 20 + b64_len + 1;
+    char *payload = proxy_alloc(payload_len);
+    if (!payload) {
+        ESP_LOGE(TAG, "Failed to allocate JSON payload for final chunk");
+        proxy_free(b64_output);
+        goto cleanup;
+    }
+    snprintf(payload, payload_len, payload_fmt, task_ctx->stream_ctx->session_id, task_ctx->chunk_index, b64_output);
+    proxy_free(b64_output);
+
+    ESP_LOGI(TAG, "Sending final chunk %d (%zu bytes PCM)", task_ctx->chunk_index, task_ctx->pcm_len);
+
+    // Configure HTTP client for streaming response
+    esp_http_client_config_t config = {
+        .url = s_config.url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 60000,  // Longer timeout for streaming response
+        .buffer_size = 4096,  // Read buffer for streaming
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to init HTTP client for final chunk");
+        proxy_free(payload);
+        goto cleanup;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Assistant-Token", s_config.token);
+
+    esp_err_t err = esp_http_client_open(client, strlen(payload));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection for final chunk: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        proxy_free(payload);
+        goto cleanup;
+    }
+
+    int wlen = esp_http_client_write(client, payload, strlen(payload));
+    proxy_free(payload);
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "Failed to write final chunk request");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        goto cleanup;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "Final chunk response: status=%d", status);
+
+    if (status != 200) {
+        ESP_LOGW(TAG, "Final chunk failed with status %d", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        goto cleanup;
+    }
+
+    // Start streaming playback - audio plays immediately as chunks arrive
+    assistant_set_state(ASSISTANT_STATE_PLAYING);
+
+    if (!audio_playback_stream_start()) {
+        ESP_LOGE(TAG, "Failed to start streaming playback");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        goto cleanup;
+    }
+
+    // Read streaming response (newline-delimited JSON) - read in chunks for efficiency
+    // Audio delta lines can be 20KB+ (16KB base64 + JSON overhead)
+    const size_t line_buffer_size = 24576;  // 24KB for large audio deltas
+    char *line_buffer = malloc(line_buffer_size);
+    if (!line_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate line buffer");
+        audio_playback_stream_end();
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        goto cleanup;
+    }
+    size_t line_pos = 0;
+    bool response_complete = false;
+    size_t total_audio_bytes = 0;
+
+    // Read buffer for chunked reading (4KB)
+    const size_t read_chunk_size = 4096;
+    char *read_buffer = malloc(read_chunk_size);
+    if (!read_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate read buffer");
+        free(line_buffer);
+        audio_playback_stream_end();
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        goto cleanup;
+    }
+
+    // Debug: Log response headers
+    int content_len = esp_http_client_get_content_length(client);
+    ESP_LOGI(TAG, "Response headers: status=%d content_len=%d", status, content_len);
+
+    char *transfer_encoding = NULL;
+    esp_http_client_get_header(client, "Transfer-Encoding", &transfer_encoding);
+    if (transfer_encoding) {
+        ESP_LOGI(TAG, "Transfer-Encoding: %s", transfer_encoding);
+    }
+
+    ESP_LOGI(TAG, "Streaming response started (immediate playback)");
+
+    int total_reads = 0;
+    while (!response_complete) {
+        // Read chunk from HTTP response
+        int read_len = esp_http_client_read_response(client, read_buffer, read_chunk_size);
+        total_reads++;
+
+        ESP_LOGI(TAG, "Read attempt %d: got %d bytes", total_reads, read_len);
+
+        if (read_len < 0) {
+            ESP_LOGE(TAG, "Failed to read streaming response");
+            break;
+        }
+        if (read_len == 0) {
+            ESP_LOGI(TAG, "End of stream after %d reads", total_reads);
+            break;  // End of stream
+        }
+
+        // Process each character in the chunk
+        for (int i = 0; i < read_len && !response_complete; i++) {
+            char ch = read_buffer[i];
+
+            if (ch == '\n' && line_pos > 0) {
+                // Parse JSON line
+                line_buffer[line_pos] = '\0';
+
+                ESP_LOGI(TAG, "Parsing JSON line (%zu bytes): %.100s%s",
+                         line_pos, line_buffer, line_pos > 100 ? "..." : "");
+
+                cJSON *json = cJSON_Parse(line_buffer);
+                if (!json) {
+                    ESP_LOGE(TAG, "JSON parse failed for line: %s", line_buffer);
+                }
+                if (json) {
+                    // Check for completion
+                    const cJSON *status_obj = cJSON_GetObjectItemCaseSensitive(json, "status");
+                    if (cJSON_IsString(status_obj)) {
+                        const char *status_str = status_obj->valuestring;
+                        if (strcmp(status_str, "complete") == 0) {
+                            ESP_LOGI(TAG, "Response complete");
+                            response_complete = true;
+                        }
+                    }
+
+                    // Decode and play PCM delta immediately
+                    const cJSON *audio_delta = cJSON_GetObjectItemCaseSensitive(json, "audio_delta");
+                    if (cJSON_IsString(audio_delta) && audio_delta->valuestring) {
+                        const char *b64_str = audio_delta->valuestring;
+                        size_t b64_str_len = strlen(b64_str);
+
+                        ESP_LOGI(TAG, "Found audio_delta: %zu bytes (base64)", b64_str_len);
+
+                        // Decode base64 PCM chunk
+                        size_t decode_len = 0;
+                        size_t decode_buf_len = (b64_str_len * 3) / 4 + 4;
+                        uint8_t *decode_buf = proxy_alloc(decode_buf_len);
+
+                        if (decode_buf) {
+                            int decode_rc = mbedtls_base64_decode(decode_buf, decode_buf_len, &decode_len,
+                                                                  (const unsigned char *)b64_str, b64_str_len);
+                            if (decode_rc == 0 && decode_len > 0) {
+                                // Stream chunk immediately to audio playback (low latency!)
+                                if (audio_playback_stream_write(decode_buf, decode_len)) {
+                                    total_audio_bytes += decode_len;
+                                    ESP_LOGI(TAG, "Streamed PCM chunk: %zu bytes (total: %zu)", decode_len, total_audio_bytes);
+                                } else {
+                                    ESP_LOGE(TAG, "Failed to stream audio chunk");
+                                }
+                            } else {
+                                ESP_LOGE(TAG, "Base64 decode failed: rc=%d len=%zu", decode_rc, decode_len);
+                            }
+                            proxy_free(decode_buf);
+                        }
+                    }
+
+                    cJSON_Delete(json);
+                }
+
+                line_pos = 0;
+            } else if (ch != '\n' && ch != '\r' && line_pos < line_buffer_size - 1) {
+                line_buffer[line_pos++] = ch;
+            }
+        }
+
+        vTaskDelay(1);  // Feed watchdog
+    }
+
+    free(read_buffer);
+    free(line_buffer);
+
+    // End streaming playback
+    audio_playback_stream_end();
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (total_audio_bytes > 0) {
+        ESP_LOGI(TAG, "Streamed %zu bytes of PCM audio (24kHz mono) with immediate playback", total_audio_bytes);
+        result = PROXY_RESULT_OK;
+    } else {
+        ESP_LOGW(TAG, "No PCM audio received");
+    }
+
+cleanup:
     proxy_free(task_ctx->pcm_data);
     free(task_ctx->stream_ctx);
 
@@ -766,18 +992,22 @@ void proxy_stream_end(proxy_stream_handle_t handle, const uint8_t *pcm_data, siz
         return;
     }
 
-    // Copy PCM data for async processing
-    task_ctx->pcm_data = proxy_alloc(pcm_len);
-    if (!task_ctx->pcm_data) {
-        ESP_LOGE(TAG, "Failed to allocate PCM data copy");
-        free(task_ctx);
-        free(stream_ctx);
-        if (cb) {
-            cb(PROXY_RESULT_FAILED, user_ctx);
+    // Copy PCM data for async processing (if any)
+    if (pcm_len > 0) {
+        task_ctx->pcm_data = proxy_alloc(pcm_len);
+        if (!task_ctx->pcm_data) {
+            ESP_LOGE(TAG, "Failed to allocate PCM data copy");
+            free(task_ctx);
+            free(stream_ctx);
+            if (cb) {
+                cb(PROXY_RESULT_FAILED, user_ctx);
+            }
+            return;
         }
-        return;
+        memcpy(task_ctx->pcm_data, pcm_data, pcm_len);
+    } else {
+        task_ctx->pcm_data = NULL;  // No data for empty final chunk
     }
-    memcpy(task_ctx->pcm_data, pcm_data, pcm_len);
 
     task_ctx->stream_ctx = stream_ctx;
     task_ctx->pcm_len = pcm_len;
