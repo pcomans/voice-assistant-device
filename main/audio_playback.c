@@ -242,13 +242,19 @@ static void buffered_playback_task(void *arg)
     }
     ESP_LOGI(TAG, "Pre-buffering complete, starting I2S playback");
 
-    while (s_streaming_active) {
-        // Read from ring buffer (blocks if empty)
+    while (true) {
+        // Read from ring buffer (blocks if empty while streaming, short timeout when draining)
+        TickType_t timeout = s_streaming_active ? pdMS_TO_TICKS(100) : pdMS_TO_TICKS(10);
         size_t item_size = 0;
-        uint8_t *item = xRingbufferReceiveUpTo(s_stream_buffer, &item_size, pdMS_TO_TICKS(100), 4096);
+        uint8_t *item = xRingbufferReceiveUpTo(s_stream_buffer, &item_size, timeout, 4096);
 
         if (!item) {
-            // Timeout - check if streaming is still active
+            // No data available - if streaming ended, we're done draining
+            if (!s_streaming_active) {
+                ESP_LOGI(TAG, "Buffer drained, ending playback");
+                break;
+            }
+            // Streaming still active, just timeout - continue waiting
             continue;
         }
 
@@ -380,9 +386,10 @@ void audio_playback_stream_end(void)
     // Signal task to stop
     s_streaming_active = false;
 
-    // Wait for playback task to finish (with timeout)
+    // Wait for playback task to finish draining buffer (up to 3 seconds)
+    // Buffer holds 2 seconds of audio, so give it time to drain completely
     int wait_count = 0;
-    while (s_buffered_playback_task && wait_count < 100) {
+    while (s_buffered_playback_task && wait_count < 300) {
         vTaskDelay(pdMS_TO_TICKS(10));
         wait_count++;
     }
