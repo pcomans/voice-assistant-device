@@ -534,3 +534,265 @@ void proxy_send_recording(proxy_result_cb_t cb, void *user_ctx)
         }
     }
 }
+
+// ==================== Chunked Streaming API (Option C) ====================
+
+typedef struct {
+    char session_id[32];
+} proxy_stream_ctx_t;
+
+proxy_stream_handle_t proxy_stream_begin(const char *session_id)
+{
+    if (!session_id) {
+        ESP_LOGE(TAG, "session_id is NULL");
+        return NULL;
+    }
+
+    proxy_stream_ctx_t *ctx = malloc(sizeof(proxy_stream_ctx_t));
+    if (!ctx) {
+        ESP_LOGE(TAG, "Failed to allocate stream context");
+        return NULL;
+    }
+
+    snprintf(ctx->session_id, sizeof(ctx->session_id), "%s", session_id);
+    ESP_LOGI(TAG, "Started streaming session: %s", ctx->session_id);
+    return (proxy_stream_handle_t)ctx;
+}
+
+bool proxy_stream_send_chunk(proxy_stream_handle_t handle, const uint8_t *pcm_data, size_t pcm_len, int chunk_index)
+{
+    if (!handle || !pcm_data || pcm_len == 0) {
+        ESP_LOGE(TAG, "Invalid chunk parameters");
+        return false;
+    }
+
+    proxy_stream_ctx_t *ctx = (proxy_stream_ctx_t *)handle;
+
+    // Base64 encode PCM data
+    size_t b64_len = 0;
+    size_t b64_buff_len = ((pcm_len + 2) / 3) * 4 + 1;
+    char *b64_output = proxy_alloc(b64_buff_len);
+    if (!b64_output) {
+        ESP_LOGE(TAG, "Failed to allocate base64 buffer for chunk");
+        return false;
+    }
+
+    int rc = mbedtls_base64_encode((unsigned char *)b64_output, b64_buff_len, &b64_len, pcm_data, pcm_len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Base64 encode failed for chunk: %d", rc);
+        proxy_free(b64_output);
+        return false;
+    }
+    b64_output[b64_len] = '\0';
+
+    // Build JSON payload
+    const char *payload_fmt = "{"
+                              "\"session_id\":\"%s\","
+                              "\"chunk_index\":%d,"
+                              "\"pcm_base64\":\"%s\","
+                              "\"is_final\":false"
+                              "}";
+    const size_t payload_len = strlen(payload_fmt) + strlen(ctx->session_id) + 20 + b64_len + 1;
+    char *payload = proxy_alloc(payload_len);
+    if (!payload) {
+        ESP_LOGE(TAG, "Failed to allocate JSON payload for chunk");
+        proxy_free(b64_output);
+        return false;
+    }
+    snprintf(payload, payload_len, payload_fmt, ctx->session_id, chunk_index, b64_output);
+    proxy_free(b64_output);
+
+    // Send chunk (quick POST, expect {"status": "partial"})
+    esp_http_client_config_t config = {
+        .url = s_config.url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 5000,  // Shorter timeout for non-final chunks
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to init HTTP client for chunk");
+        proxy_free(payload);
+        return false;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Assistant-Token", s_config.token);
+
+    bool success = false;
+    esp_err_t err = esp_http_client_open(client, strlen(payload));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection for chunk: %s", esp_err_to_name(err));
+    } else {
+        int wlen = esp_http_client_write(client, payload, strlen(payload));
+        if (wlen < 0) {
+            ESP_LOGE(TAG, "Failed to write chunk request");
+        } else {
+            esp_http_client_fetch_headers(client);
+            int status = esp_http_client_get_status_code(client);
+            if (status == 200) {
+                ESP_LOGD(TAG, "Chunk %d sent successfully (%zu bytes PCM)", chunk_index, pcm_len);
+                success = true;
+            } else {
+                ESP_LOGW(TAG, "Chunk %d failed with status %d", chunk_index, status);
+            }
+        }
+        esp_http_client_close(client);
+    }
+
+    esp_http_client_cleanup(client);
+    proxy_free(payload);
+    return success;
+}
+
+typedef struct {
+    proxy_stream_ctx_t *stream_ctx;
+    uint8_t *pcm_data;
+    size_t pcm_len;
+    int chunk_index;
+    proxy_result_cb_t cb;
+    void *user_ctx;
+} proxy_stream_end_task_ctx_t;
+
+static void proxy_stream_end_task(void *arg)
+{
+    proxy_stream_end_task_ctx_t *task_ctx = (proxy_stream_end_task_ctx_t *)arg;
+
+    // TODO: Implement streaming response handling
+    // For now, use same approach as proxy_send_recording but with chunk_index parameter
+
+    proxy_result_t result = PROXY_RESULT_FAILED;
+
+    // Send final chunk
+    // Base64 encode
+    size_t b64_len = 0;
+    size_t b64_buff_len = ((task_ctx->pcm_len + 2) / 3) * 4 + 1;
+    char *b64_output = proxy_alloc(b64_buff_len);
+    if (b64_output) {
+        int rc = mbedtls_base64_encode((unsigned char *)b64_output, b64_buff_len, &b64_len,
+                                      task_ctx->pcm_data, task_ctx->pcm_len);
+        if (rc == 0) {
+            b64_output[b64_len] = '\0';
+
+            // Build JSON payload
+            const char *payload_fmt = "{"
+                                      "\"session_id\":\"%s\","
+                                      "\"chunk_index\":%d,"
+                                      "\"pcm_base64\":\"%s\","
+                                      "\"is_final\":true"
+                                      "}";
+            const size_t payload_len = strlen(payload_fmt) + strlen(task_ctx->stream_ctx->session_id) + 20 + b64_len + 1;
+            char *payload = proxy_alloc(payload_len);
+            if (payload) {
+                snprintf(payload, payload_len, payload_fmt, task_ctx->stream_ctx->session_id, task_ctx->chunk_index, b64_output);
+
+                ESP_LOGI(TAG, "Sending final chunk %d (%zu bytes PCM)", task_ctx->chunk_index, task_ctx->pcm_len);
+
+                esp_http_client_config_t config = {
+                    .url = s_config.url,
+                    .method = HTTP_METHOD_POST,
+                    .timeout_ms = 30000,  // Longer timeout for final chunk
+                };
+
+                esp_http_client_handle_t client = esp_http_client_init(&config);
+                if (client) {
+                    esp_http_client_set_header(client, "Content-Type", "application/json");
+                    esp_http_client_set_header(client, "X-Assistant-Token", s_config.token);
+
+                    esp_err_t err = esp_http_client_open(client, strlen(payload));
+                    if (err == ESP_OK) {
+                        int wlen = esp_http_client_write(client, payload, strlen(payload));
+                        if (wlen >= 0) {
+                            int64_t content_length = esp_http_client_fetch_headers(client);
+                            int status = esp_http_client_get_status_code(client);
+                            ESP_LOGI(TAG, "Final chunk response: status=%d, content_length=%lld", status, content_length);
+
+                            if (status == 200) {
+                                size_t response_len = 0;
+                                char *response_body = read_response_body(client, content_length, &response_len);
+
+                                if (response_body && response_len > 0) {
+                                    ESP_LOGI(TAG, "Received streaming response (%zu bytes)", response_len);
+                                    result = handle_response_body(response_body);
+                                    proxy_free(response_body);
+                                } else {
+                                    ESP_LOGW(TAG, "Empty streaming response");
+                                }
+                            }
+                        }
+                        esp_http_client_close(client);
+                    }
+                    esp_http_client_cleanup(client);
+                }
+                proxy_free(payload);
+            }
+            proxy_free(b64_output);
+        }
+    }
+
+    // Clean up
+    proxy_free(task_ctx->pcm_data);
+    free(task_ctx->stream_ctx);
+
+    if (task_ctx->cb) {
+        task_ctx->cb(result, task_ctx->user_ctx);
+    }
+
+    free(task_ctx);
+    vTaskDelete(NULL);
+}
+
+void proxy_stream_end(proxy_stream_handle_t handle, const uint8_t *pcm_data, size_t pcm_len,
+                     int chunk_index, proxy_result_cb_t cb, void *user_ctx)
+{
+    if (!handle) {
+        ESP_LOGE(TAG, "Invalid stream handle");
+        if (cb) {
+            cb(PROXY_RESULT_FAILED, user_ctx);
+        }
+        return;
+    }
+
+    proxy_stream_ctx_t *stream_ctx = (proxy_stream_ctx_t *)handle;
+
+    // Allocate task context
+    proxy_stream_end_task_ctx_t *task_ctx = malloc(sizeof(proxy_stream_end_task_ctx_t));
+    if (!task_ctx) {
+        ESP_LOGE(TAG, "Failed to allocate stream end task context");
+        free(stream_ctx);
+        if (cb) {
+            cb(PROXY_RESULT_FAILED, user_ctx);
+        }
+        return;
+    }
+
+    // Copy PCM data for async processing
+    task_ctx->pcm_data = proxy_alloc(pcm_len);
+    if (!task_ctx->pcm_data) {
+        ESP_LOGE(TAG, "Failed to allocate PCM data copy");
+        free(task_ctx);
+        free(stream_ctx);
+        if (cb) {
+            cb(PROXY_RESULT_FAILED, user_ctx);
+        }
+        return;
+    }
+    memcpy(task_ctx->pcm_data, pcm_data, pcm_len);
+
+    task_ctx->stream_ctx = stream_ctx;
+    task_ctx->pcm_len = pcm_len;
+    task_ctx->chunk_index = chunk_index;
+    task_ctx->cb = cb;
+    task_ctx->user_ctx = user_ctx;
+
+    // Spawn task to handle final chunk and streaming response
+    if (xTaskCreatePinnedToCore(proxy_stream_end_task, "proxy_stream_end", 24576, task_ctx, 4, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start stream end task");
+        proxy_free(task_ctx->pcm_data);
+        free(task_ctx);
+        free(stream_ctx);
+        if (cb) {
+            cb(PROXY_RESULT_FAILED, user_ctx);
+        }
+    }
+}
