@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/ringbuf.h"
 
 #define PLAYBACK_I2S_PORT      I2S_NUM_0
 #define PLAYBACK_SAMPLE_RATE   24000  // Match OpenAI Realtime API output
@@ -18,6 +19,11 @@
 #define PLAYBACK_GPIO_DOUT     GPIO_NUM_47
 #define PLAYBACK_GPIO_MCLK     GPIO_NUM_NC
 
+// Buffered streaming config
+#define STREAM_BUFFER_SIZE     (96000)  // 2 seconds at 24kHz 16-bit = 96KB
+#define PREBUFFER_MS           500      // Wait for 500ms before starting playback
+#define PREBUFFER_BYTES        (PLAYBACK_SAMPLE_RATE * 2 * PREBUFFER_MS / 1000)  // 24KB
+
 static const char *TAG = "audio_playback";
 static i2s_chan_handle_t s_tx_chan = NULL;
 static TaskHandle_t s_playback_task = NULL;
@@ -25,6 +31,11 @@ static audio_playback_callback_t s_callback = NULL;
 static void *s_callback_ctx = NULL;
 static uint8_t s_volume = 100;  // Default volume 100%
 static bool s_streaming_active = false;
+
+// Buffered streaming playback
+static RingbufHandle_t s_stream_buffer = NULL;
+static TaskHandle_t s_buffered_playback_task = NULL;
+static bool s_prebuffer_complete = false;
 
 typedef struct {
     uint8_t *data;
@@ -209,7 +220,69 @@ void audio_playback_stop(void)
     s_streaming_active = false;
 }
 
-// Streaming playback API for immediate, low-latency playback
+// Buffered playback task - reads from ring buffer and writes to I2S
+static void buffered_playback_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Buffered playback task started on core %d", xPortGetCoreID());
+
+    uint8_t *read_buffer = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL);
+    if (!read_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate read buffer for playback task");
+        s_buffered_playback_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t total_played = 0;
+
+    // Wait for pre-buffering to complete
+    while (s_streaming_active && !s_prebuffer_complete) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "Pre-buffering complete, starting I2S playback");
+
+    while (s_streaming_active) {
+        // Read from ring buffer (blocks if empty)
+        size_t item_size = 0;
+        uint8_t *item = xRingbufferReceiveUpTo(s_stream_buffer, &item_size, pdMS_TO_TICKS(100), 4096);
+
+        if (!item) {
+            // Timeout - check if streaming is still active
+            continue;
+        }
+
+        // Apply volume if needed
+        if (s_volume != 100) {
+            memcpy(read_buffer, item, item_size);
+            size_t sample_count = item_size / sizeof(int16_t);
+            apply_volume((int16_t *)read_buffer, sample_count, s_volume);
+            vRingbufferReturnItem(s_stream_buffer, item);
+            item = read_buffer;
+        }
+
+        // Write to I2S
+        size_t bytes_written = 0;
+        esp_err_t err = i2s_channel_write(s_tx_chan, item, item_size, &bytes_written, portMAX_DELAY);
+
+        if (s_volume == 100) {
+            vRingbufferReturnItem(s_stream_buffer, item);
+        }
+
+        if (err == ESP_OK) {
+            total_played += bytes_written;
+        } else {
+            ESP_LOGE(TAG, "I2S write error: %s", esp_err_to_name(err));
+        }
+    }
+
+    free(read_buffer);
+    ESP_LOGI(TAG, "Buffered playback task ended, played %zu bytes total", total_played);
+    s_buffered_playback_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// Streaming playback API with buffering for smooth playback
 bool audio_playback_stream_start(void)
 {
     if (!s_tx_chan) {
@@ -225,8 +298,37 @@ bool audio_playback_stream_start(void)
         return false;
     }
 
+    // Create ring buffer for streaming playback
+    s_stream_buffer = xRingbufferCreate(STREAM_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+    if (!s_stream_buffer) {
+        ESP_LOGE(TAG, "Failed to create stream buffer");
+        return false;
+    }
+
     s_streaming_active = true;
-    ESP_LOGI(TAG, "Streaming playback started");
+    s_prebuffer_complete = false;
+
+    // Create buffered playback task on core 1 with high priority
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        buffered_playback_task,
+        "audio_playback_buffered",
+        8192,
+        NULL,
+        6,  // Higher priority than HTTP reader (priority 4)
+        &s_buffered_playback_task,
+        1   // Core 1 (separate from HTTP/WiFi on core 0)
+    );
+
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create buffered playback task");
+        vRingbufferDelete(s_stream_buffer);
+        s_stream_buffer = NULL;
+        s_streaming_active = false;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Buffered streaming playback started (buffer: %d bytes, prebuffer: %d ms)",
+             STREAM_BUFFER_SIZE, PREBUFFER_MS);
 
     if (s_callback) {
         s_callback(AUDIO_PLAYBACK_EVENT_STARTED, s_callback_ctx);
@@ -237,7 +339,7 @@ bool audio_playback_stream_start(void)
 
 bool audio_playback_stream_write(const uint8_t *data, size_t length_bytes)
 {
-    if (!s_streaming_active) {
+    if (!s_streaming_active || !s_stream_buffer) {
         ESP_LOGW(TAG, "Streaming not active, call audio_playback_stream_start() first");
         return false;
     }
@@ -245,36 +347,25 @@ bool audio_playback_stream_write(const uint8_t *data, size_t length_bytes)
         return true;  // Empty chunk, skip
     }
 
-    // For streaming, apply volume and write directly to I2S (no buffering)
-    // Allocate temp buffer for volume adjustment if needed
-    uint8_t *write_data = (uint8_t *)data;
-    uint8_t *volume_buffer = NULL;
-
-    if (s_volume != 100) {
-        volume_buffer = malloc(length_bytes);
-        if (volume_buffer) {
-            memcpy(volume_buffer, data, length_bytes);
-            size_t num_samples = length_bytes / sizeof(int16_t);
-            apply_volume((int16_t *)volume_buffer, num_samples, s_volume);
-            write_data = volume_buffer;
-        } else {
-            ESP_LOGW(TAG, "Failed to allocate volume buffer, playing at original volume");
-        }
-    }
-
-    size_t bytes_written = 0;
-    esp_err_t err = i2s_channel_write(s_tx_chan, write_data, length_bytes, &bytes_written, portMAX_DELAY);
-
-    if (volume_buffer) {
-        free(volume_buffer);
-    }
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Streaming I2S write failed: %s", esp_err_to_name(err));
+    // Push to ring buffer (blocking - waits if full, provides backpressure)
+    BaseType_t ret = xRingbufferSend(s_stream_buffer, data, length_bytes, portMAX_DELAY);
+    if (ret != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to write to stream buffer (should never happen with portMAX_DELAY)");
         return false;
     }
 
-    ESP_LOGD(TAG, "Streamed %zu bytes to I2S", bytes_written);
+    // Check pre-buffering
+    if (!s_prebuffer_complete) {
+        size_t buffered = xRingbufferGetCurFreeSize(s_stream_buffer);
+        size_t used = STREAM_BUFFER_SIZE - buffered;
+
+        if (used >= PREBUFFER_BYTES) {
+            s_prebuffer_complete = true;
+            ESP_LOGI(TAG, "Pre-buffer complete (%zu bytes), playback task will start consuming",
+                     used);
+        }
+    }
+
     return true;
 }
 
@@ -284,8 +375,32 @@ void audio_playback_stream_end(void)
         return;
     }
 
+    ESP_LOGI(TAG, "Ending buffered streaming playback...");
+
+    // Signal task to stop
     s_streaming_active = false;
-    ESP_LOGI(TAG, "Streaming playback ended");
+
+    // Wait for playback task to finish (with timeout)
+    int wait_count = 0;
+    while (s_buffered_playback_task && wait_count < 100) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_count++;
+    }
+
+    if (s_buffered_playback_task) {
+        ESP_LOGW(TAG, "Playback task didn't finish, forcefully deleting");
+        vTaskDelete(s_buffered_playback_task);
+        s_buffered_playback_task = NULL;
+    }
+
+    // Clean up ring buffer
+    if (s_stream_buffer) {
+        vRingbufferDelete(s_stream_buffer);
+        s_stream_buffer = NULL;
+    }
+
+    s_prebuffer_complete = false;
+    ESP_LOGI(TAG, "Buffered streaming playback ended");
 
     if (s_callback) {
         s_callback(AUDIO_PLAYBACK_EVENT_COMPLETED, s_callback_ctx);

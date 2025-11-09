@@ -815,27 +815,12 @@ static void proxy_stream_end_task(void *arg)
         goto cleanup;
     }
 
-    // Read streaming response (newline-delimited JSON) - read in chunks for efficiency
-    // Audio delta lines can be 20KB+ (16KB base64 + JSON overhead)
-    const size_t line_buffer_size = 24576;  // 24KB for large audio deltas
-    char *line_buffer = malloc(line_buffer_size);
-    if (!line_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate line buffer");
-        audio_playback_stream_end();
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        goto cleanup;
-    }
-    size_t line_pos = 0;
-    bool response_complete = false;
-    size_t total_audio_bytes = 0;
-
-    // Read buffer for chunked reading (4KB)
+    // Read streaming response - raw binary PCM (no JSON, no base64!)
+    // Read buffer for binary chunks (4KB)
     const size_t read_chunk_size = 4096;
-    char *read_buffer = malloc(read_chunk_size);
+    uint8_t *read_buffer = malloc(read_chunk_size);
     if (!read_buffer) {
         ESP_LOGE(TAG, "Failed to allocate read buffer");
-        free(line_buffer);
         audio_playback_stream_end();
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
@@ -852,96 +837,39 @@ static void proxy_stream_end_task(void *arg)
         ESP_LOGI(TAG, "Transfer-Encoding: %s", transfer_encoding);
     }
 
-    ESP_LOGI(TAG, "Streaming response started (immediate playback)");
+    ESP_LOGI(TAG, "Binary streaming started - reading raw PCM chunks");
 
+    size_t total_audio_bytes = 0;
     int total_reads = 0;
-    while (!response_complete) {
-        // Read chunk from HTTP response
-        int read_len = esp_http_client_read_response(client, read_buffer, read_chunk_size);
-        total_reads++;
 
-        ESP_LOGI(TAG, "Read attempt %d: got %d bytes", total_reads, read_len);
+    while (true) {
+        // Read raw binary PCM chunk from HTTP response
+        int read_len = esp_http_client_read_response(client, (char *)read_buffer, read_chunk_size);
+        total_reads++;
 
         if (read_len < 0) {
             ESP_LOGE(TAG, "Failed to read streaming response");
             break;
         }
         if (read_len == 0) {
-            ESP_LOGI(TAG, "End of stream after %d reads", total_reads);
+            ESP_LOGI(TAG, "End of binary stream after %d reads", total_reads);
             break;  // End of stream
         }
 
-        // Process each character in the chunk
-        for (int i = 0; i < read_len && !response_complete; i++) {
-            char ch = read_buffer[i];
-
-            if (ch == '\n' && line_pos > 0) {
-                // Parse JSON line
-                line_buffer[line_pos] = '\0';
-
-                ESP_LOGI(TAG, "Parsing JSON line (%zu bytes): %.100s%s",
-                         line_pos, line_buffer, line_pos > 100 ? "..." : "");
-
-                cJSON *json = cJSON_Parse(line_buffer);
-                if (!json) {
-                    ESP_LOGE(TAG, "JSON parse failed for line: %s", line_buffer);
-                }
-                if (json) {
-                    // Check for completion
-                    const cJSON *status_obj = cJSON_GetObjectItemCaseSensitive(json, "status");
-                    if (cJSON_IsString(status_obj)) {
-                        const char *status_str = status_obj->valuestring;
-                        if (strcmp(status_str, "complete") == 0) {
-                            ESP_LOGI(TAG, "Response complete");
-                            response_complete = true;
-                        }
-                    }
-
-                    // Decode and play PCM delta immediately
-                    const cJSON *audio_delta = cJSON_GetObjectItemCaseSensitive(json, "audio_delta");
-                    if (cJSON_IsString(audio_delta) && audio_delta->valuestring) {
-                        const char *b64_str = audio_delta->valuestring;
-                        size_t b64_str_len = strlen(b64_str);
-
-                        ESP_LOGI(TAG, "Found audio_delta: %zu bytes (base64)", b64_str_len);
-
-                        // Decode base64 PCM chunk
-                        size_t decode_len = 0;
-                        size_t decode_buf_len = (b64_str_len * 3) / 4 + 4;
-                        uint8_t *decode_buf = proxy_alloc(decode_buf_len);
-
-                        if (decode_buf) {
-                            int decode_rc = mbedtls_base64_decode(decode_buf, decode_buf_len, &decode_len,
-                                                                  (const unsigned char *)b64_str, b64_str_len);
-                            if (decode_rc == 0 && decode_len > 0) {
-                                // Stream chunk immediately to audio playback (low latency!)
-                                if (audio_playback_stream_write(decode_buf, decode_len)) {
-                                    total_audio_bytes += decode_len;
-                                    ESP_LOGI(TAG, "Streamed PCM chunk: %zu bytes (total: %zu)", decode_len, total_audio_bytes);
-                                } else {
-                                    ESP_LOGE(TAG, "Failed to stream audio chunk");
-                                }
-                            } else {
-                                ESP_LOGE(TAG, "Base64 decode failed: rc=%d len=%zu", decode_rc, decode_len);
-                            }
-                            proxy_free(decode_buf);
-                        }
-                    }
-
-                    cJSON_Delete(json);
-                }
-
-                line_pos = 0;
-            } else if (ch != '\n' && ch != '\r' && line_pos < line_buffer_size - 1) {
-                line_buffer[line_pos++] = ch;
+        // Stream raw PCM chunk directly to audio playback (no JSON, no base64!)
+        if (audio_playback_stream_write(read_buffer, read_len)) {
+            total_audio_bytes += read_len;
+            if (total_reads % 10 == 0) {  // Log every 10th chunk to reduce spam
+                ESP_LOGI(TAG, "Read %d: streamed %zu bytes total", total_reads, total_audio_bytes);
             }
+        } else {
+            ESP_LOGW(TAG, "Ring buffer full, dropped %d bytes", read_len);
         }
 
         vTaskDelay(1);  // Feed watchdog
     }
 
     free(read_buffer);
-    free(line_buffer);
 
     // End streaming playback
     audio_playback_stream_end();
