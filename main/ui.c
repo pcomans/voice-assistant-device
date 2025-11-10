@@ -40,12 +40,19 @@ void ui_init(ui_event_cb_t cb, void *user_ctx)
     // Create UI elements
     lv_obj_t *screen = lv_scr_act();
     s_button = lv_btn_create(screen);
+    lv_obj_set_size(s_button, 300, 120);  // 2x bigger button (default is ~150x60)
     lv_obj_center(s_button);
     lv_obj_add_event_cb(s_button, button_event_cb, LV_EVENT_CLICKED, NULL);
 
     s_label = lv_label_create(s_button);
     lv_label_set_text(s_label, "Start Recording");
     lv_obj_center(s_label);
+
+    // Make label text 2x bigger
+    static lv_style_t style_label;
+    lv_style_init(&style_label);
+    lv_style_set_text_font(&style_label, &lv_font_montserrat_28);
+    lv_obj_add_style(s_label, &style_label, 0);
 
     ESP_LOGI(TAG, "UI initialised");
 }
