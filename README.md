@@ -83,6 +83,25 @@ For example, if your proxy is running on `192.168.1.100`:
 #define PROXY_DEFAULT_URL   "http://192.168.1.100:8000/v1/audio"
 ```
 
+### 3. Authentication Token (Optional)
+
+The device uses a shared secret token to authenticate with the proxy. The default token is already configured in `main/proxy_client.c`:
+
+```c
+#define PROXY_DEFAULT_TOKEN "498b1b65-26a3-49e8-a55e-46a0b47365e2"
+```
+
+**For first-time setup:** Use this default token in your proxy's `.env` file:
+```bash
+ASSISTANT_SHARED_SECRET=498b1b65-26a3-49e8-a55e-46a0b47365e2
+```
+
+**For enhanced security:** You can change the token to a custom value:
+1. Generate a new token (or use any secure random string)
+2. Update `PROXY_DEFAULT_TOKEN` in `main/proxy_client.c`
+3. Update `ASSISTANT_SHARED_SECRET` in the proxy's `.env` file with the same value
+4. Rebuild and reflash the device firmware
+
 ## Build and Flash
 
 ### 1. Set up ESP-IDF environment
