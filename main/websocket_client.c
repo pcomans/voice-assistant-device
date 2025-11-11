@@ -67,6 +67,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "WebSocket error occurred");
+        if (data) {
+            ESP_LOGE(TAG, "Error details - type: %d, handshake_status: %d, tls_err: %d, sock_errno: %d",
+                     data->error_handle.error_type,
+                     data->error_handle.esp_ws_handshake_status_code,
+                     data->error_handle.esp_tls_last_esp_err,
+                     data->error_handle.esp_transport_sock_errno);
+        }
         break;
 
     default:
@@ -178,11 +185,11 @@ esp_err_t ws_client_send_audio(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Send binary frame (opcode 0x02)
-    int ret = esp_websocket_client_send_bin(s_client, (const char *)data, len, portMAX_DELAY);
+    // Send binary frame (opcode 0x02) with timeout to prevent blocking
+    int ret = esp_websocket_client_send_bin(s_client, (const char *)data, len, pdMS_TO_TICKS(5000));
     if (ret < 0) {
-        ESP_LOGE(TAG, "Failed to send WebSocket data");
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "Failed to send WebSocket data (timeout or network error)");
+        return ESP_ERR_TIMEOUT;
     }
 
     ESP_LOGD(TAG, "Sent %d bytes via WebSocket", ret);

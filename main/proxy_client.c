@@ -281,6 +281,13 @@ static void proxy_stream_end_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(check_interval_ms));
         elapsed_ms += check_interval_ms;
 
+        // Check if WebSocket disconnected during streaming
+        if (!s_ws_connected) {
+            ESP_LOGW(TAG, "WebSocket disconnected during stream end, aborting");
+            result = PROXY_RESULT_FAILED;
+            break;
+        }
+
         // Check if we're still receiving audio
         size_t current_audio_bytes = s_received_audio_bytes;
         if (current_audio_bytes == last_audio_bytes) {
