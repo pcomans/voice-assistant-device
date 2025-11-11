@@ -25,7 +25,8 @@ HTTP stream (raw 24kHz PCM) → FreeRTOS Ring Buffer → I2S0 (16-bit) → PCM51
 **Key Characteristics**:
 - **No custom PCM buffer** for capture (streaming chunks sent immediately)
 - **FreeRTOS ring buffer** for playback (built-in, 2-second pre-buffering)
-- **Raw binary PCM** (no base64 encoding on device)
+- **Upload**: Base64-encoded PCM in JSON payload (for HTTP compatibility)
+- **Download**: Raw binary PCM stream (no JSON, no base64 decoding needed)
 - **Latency**: 176-426ms total (10x better than previous batch processing)
 
 ---
@@ -195,7 +196,7 @@ Formula: `bytes = sample_rate × duration_sec × 2 (bytes per sample)`
 
 Based on demo code and current implementation:
 - Audio capture (streaming): 4KB
-- Audio playback (buffered): 4KB
+- Audio playback (buffered): 8KB (higher priority, needs more stack for ring buffer operations)
 - Network/HTTP tasks: 24KB (proxy client with TLS)
 - LVGL UI: 4KB
 
