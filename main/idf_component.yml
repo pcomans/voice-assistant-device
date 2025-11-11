@@ -17,3 +17,4 @@ dependencies:
   espressif/cJSON: ^1.7.18
   lvgl/lvgl: ^8
   espressif/esp_audio_codec: ^2.3.0
+  espressif/esp_websocket_client: '*'

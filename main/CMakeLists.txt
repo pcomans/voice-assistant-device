@@ -4,6 +4,7 @@ idf_component_register(
         "audio_controller.c"
         "audio_playback.c"
         "proxy_client.c"
+        "websocket_client.c"
         "ui.c"
         "drivers/lcd/ST77916.c"
         "drivers/lcd/esp_lcd_st77916/esp_lcd_st77916.c"
@@ -23,12 +24,10 @@ idf_component_register(
         "drivers/lvgl"
     REQUIRES
         esp_event
-        esp_http_client
         esp_netif
         esp_wifi
         nvs_flash
         esp_ringbuf
-        mbedtls
         esp_driver_i2s
         esp_driver_gpio
         esp_driver_spi
@@ -36,4 +35,5 @@ idf_component_register(
         esp_driver_ledc
         esp_lcd
         driver
+        esp_websocket_client
 )

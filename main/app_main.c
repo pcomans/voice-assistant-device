@@ -87,6 +87,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         assistant_set_wifi_connected(true);
+
+        // WiFi is ready, connect to proxy
+        proxy_client_connect();
     }
 }
 

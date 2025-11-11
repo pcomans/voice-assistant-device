@@ -1,0 +1,74 @@
+#pragma once
+
+#include "esp_err.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/**
+ * @brief Callback for received audio data from WebSocket
+ *
+ * @param data Pointer to received audio data
+ * @param len Length of received data in bytes
+ * @param user_ctx User context pointer passed during init
+ */
+typedef void (*ws_audio_received_cb_t)(const uint8_t *data, size_t len, void *user_ctx);
+
+/**
+ * @brief Callback for WebSocket connection state changes
+ *
+ * @param connected true if connected, false if disconnected
+ * @param user_ctx User context pointer passed during init
+ */
+typedef void (*ws_state_change_cb_t)(bool connected, void *user_ctx);
+
+/**
+ * @brief Initialize WebSocket client
+ *
+ * @param uri WebSocket URI (e.g., "ws://192.168.7.75:8000/ws")
+ * @param audio_cb Callback for received audio data
+ * @param state_cb Callback for connection state changes
+ * @param user_ctx User context passed to callbacks
+ * @return ESP_OK on success
+ */
+esp_err_t ws_client_init(const char *uri,
+                          ws_audio_received_cb_t audio_cb,
+                          ws_state_change_cb_t state_cb,
+                          void *user_ctx);
+
+/**
+ * @brief Connect to WebSocket server
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t ws_client_connect(void);
+
+/**
+ * @brief Send binary audio data over WebSocket
+ *
+ * @param data Pointer to audio data
+ * @param len Length of data in bytes
+ * @return ESP_OK on success
+ */
+esp_err_t ws_client_send_audio(const uint8_t *data, size_t len);
+
+/**
+ * @brief Check if WebSocket is connected
+ *
+ * @return true if connected, false otherwise
+ */
+bool ws_client_is_connected(void);
+
+/**
+ * @brief Disconnect from WebSocket server
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t ws_client_disconnect(void);
+
+/**
+ * @brief Cleanup and destroy WebSocket client
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t ws_client_destroy(void);

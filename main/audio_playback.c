@@ -304,12 +304,27 @@ bool audio_playback_stream_start(void)
         return false;
     }
 
-    // Create ring buffer for streaming playback
-    s_stream_buffer = xRingbufferCreate(STREAM_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
+    // Clean up any existing buffer (safety check)
+    if (s_stream_buffer) {
+        ESP_LOGW(TAG, "Cleaning up existing stream buffer");
+        vRingbufferDelete(s_stream_buffer);
+        s_stream_buffer = NULL;
+    }
+
+    // Log free heap before creating buffer
+    ESP_LOGI(TAG, "Free heap before buffer create: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // Create ring buffer for streaming playback from SPIRAM
+    // Use xRingbufferCreateWithCaps to explicitly allocate from SPIRAM
+    // BYTEBUF type required for xRingbufferReceiveUpTo
+    s_stream_buffer = xRingbufferCreateWithCaps(STREAM_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (!s_stream_buffer) {
-        ESP_LOGE(TAG, "Failed to create stream buffer");
+        ESP_LOGE(TAG, "Failed to create stream buffer (%d bytes, type=BYTEBUF, from SPIRAM) - free heap: %lu",
+                 STREAM_BUFFER_SIZE, (unsigned long)esp_get_free_heap_size());
         return false;
     }
+
+    ESP_LOGI(TAG, "Stream buffer created successfully");
 
     s_streaming_active = true;
     s_prebuffer_complete = false;

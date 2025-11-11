@@ -14,6 +14,9 @@ typedef void (*proxy_result_cb_t)(proxy_result_t result, void *user_ctx);
 
 void proxy_client_init(void);
 
+// Connect to proxy (call after WiFi is connected)
+void proxy_client_connect(void);
+
 // Get persistent session ID (loaded from NVS, persists across reboots)
 const char *proxy_get_session_id(void);
 

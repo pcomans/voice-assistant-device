@@ -6,20 +6,20 @@
 
 #include "audio_playback.h"
 #include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "mbedtls/base64.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
 #include "smart_assistant.h"
+#include "websocket_client.h"
 
 static const char *TAG = "proxy_client";
 
-#define PROXY_DEFAULT_URL   "http://192.168.7.75:8000/v1/audio"
+#define PROXY_DEFAULT_URL   "ws://192.168.7.75:8000/ws"
+
 #define PROXY_DEFAULT_TOKEN "498b1b65-26a3-49e8-a55e-46a0b47365e2"
 
 // NVS keys for persistent session ID
@@ -39,6 +39,11 @@ static proxy_config_t s_config = {
     .session_id = {0},
     .session_id_loaded = false,
 };
+
+// WebSocket state for receiving audio
+static bool s_ws_connected = false;
+static bool s_ws_receiving_audio = false;
+static size_t s_received_audio_bytes = 0;
 
 static void *proxy_alloc(size_t size)
 {
@@ -100,11 +105,62 @@ generate_new:
     s_config.session_id_loaded = true;
 }
 
+// WebSocket callbacks
+static void ws_audio_received_handler(const uint8_t *data, size_t len, void *user_ctx)
+{
+    if (!s_ws_receiving_audio) {
+        ESP_LOGD(TAG, "Ignoring audio data (not in receiving mode)");
+        return;
+    }
+
+    // Stream audio directly to playback
+    if (audio_playback_stream_write(data, len)) {
+        s_received_audio_bytes += len;
+        ESP_LOGD(TAG, "Streamed %zu bytes to playback (total: %zu)", len, s_received_audio_bytes);
+    } else {
+        ESP_LOGW(TAG, "Ring buffer full, dropped %zu bytes", len);
+    }
+}
+
+static void ws_state_change_handler(bool connected, void *user_ctx)
+{
+    s_ws_connected = connected;
+    if (connected) {
+        ESP_LOGI(TAG, "WebSocket connected to proxy");
+    } else {
+        ESP_LOGW(TAG, "WebSocket disconnected from proxy");
+        s_ws_receiving_audio = false;
+    }
+}
+
 void proxy_client_init(void)
 {
     load_or_create_session_id();
     ESP_LOGI(TAG, "Proxy client initialised using %s (session: %s)", s_config.url, s_config.session_id);
+
+    // Initialize WebSocket client (but don't connect yet - wait for WiFi)
+    esp_err_t err = ws_client_init(s_config.url, ws_audio_received_handler, ws_state_change_handler, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize WebSocket client: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "WebSocket client initialized (waiting for WiFi to connect)");
     // TODO: load proxy URL/token from NVS, warm up TLS credentials.
+}
+
+void proxy_client_connect(void)
+{
+    ESP_LOGI(TAG, "WiFi ready, connecting WebSocket to proxy...");
+
+    // Connect to WebSocket server
+    esp_err_t err = ws_client_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start WebSocket connection: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "WebSocket connection initiated");
 }
 
 const char *proxy_get_session_id(void)
@@ -146,83 +202,34 @@ bool proxy_stream_send_chunk(proxy_stream_handle_t handle, const uint8_t *pcm_da
         return false;
     }
 
-    proxy_stream_ctx_t *ctx = (proxy_stream_ctx_t *)handle;
-
-    // Base64 encode PCM data
-    size_t b64_len = 0;
-    size_t b64_buff_len = ((pcm_len + 2) / 3) * 4 + 1;
-    char *b64_output = proxy_alloc(b64_buff_len);
-    if (!b64_output) {
-        ESP_LOGE(TAG, "Failed to allocate base64 buffer for chunk");
+    // Send raw binary PCM directly via WebSocket
+    if (!s_ws_connected) {
+        ESP_LOGW(TAG, "WebSocket not connected, cannot send chunk %d", chunk_index);
         return false;
     }
 
-    int rc = mbedtls_base64_encode((unsigned char *)b64_output, b64_buff_len, &b64_len, pcm_data, pcm_len);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Base64 encode failed for chunk: %d", rc);
-        proxy_free(b64_output);
-        return false;
-    }
-    b64_output[b64_len] = '\0';
+    // Enable receiving mode on FIRST chunk (proxy echoes immediately)
+    if (chunk_index == 0 && !s_ws_receiving_audio) {
+        ESP_LOGI(TAG, "First chunk - enabling audio receiving and starting playback buffer");
+        s_received_audio_bytes = 0;
+        s_ws_receiving_audio = true;
 
-    // Build JSON payload
-    const char *payload_fmt = "{"
-                              "\"session_id\":\"%s\","
-                              "\"chunk_index\":%d,"
-                              "\"pcm_base64\":\"%s\","
-                              "\"is_final\":false"
-                              "}";
-    const size_t payload_len = strlen(payload_fmt) + strlen(ctx->session_id) + 20 + b64_len + 1;
-    char *payload = proxy_alloc(payload_len);
-    if (!payload) {
-        ESP_LOGE(TAG, "Failed to allocate JSON payload for chunk");
-        proxy_free(b64_output);
-        return false;
-    }
-    snprintf(payload, payload_len, payload_fmt, ctx->session_id, chunk_index, b64_output);
-    proxy_free(b64_output);
-
-    // Send chunk (quick POST, expect {"status": "partial"})
-    esp_http_client_config_t config = {
-        .url = s_config.url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 5000,  // Shorter timeout for non-final chunks
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGE(TAG, "Failed to init HTTP client for chunk");
-        proxy_free(payload);
-        return false;
-    }
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "X-Assistant-Token", s_config.token);
-
-    bool success = false;
-    esp_err_t err = esp_http_client_open(client, strlen(payload));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection for chunk: %s", esp_err_to_name(err));
-    } else {
-        int wlen = esp_http_client_write(client, payload, strlen(payload));
-        if (wlen < 0) {
-            ESP_LOGE(TAG, "Failed to write chunk request");
-        } else {
-            esp_http_client_fetch_headers(client);
-            int status = esp_http_client_get_status_code(client);
-            if (status == 200) {
-                ESP_LOGD(TAG, "Chunk %d sent successfully (%zu bytes PCM)", chunk_index, pcm_len);
-                success = true;
-            } else {
-                ESP_LOGW(TAG, "Chunk %d failed with status %d", chunk_index, status);
-            }
+        // Start playback stream to receive echoed audio (but don't change state yet - still recording)
+        if (!audio_playback_stream_start()) {
+            ESP_LOGE(TAG, "Failed to start streaming playback");
+            s_ws_receiving_audio = false;
+            return false;
         }
-        esp_http_client_close(client);
     }
 
-    esp_http_client_cleanup(client);
-    proxy_free(payload);
-    return success;
+    esp_err_t err = ws_client_send_audio(pcm_data, pcm_len);
+    if (err == ESP_OK) {
+        ESP_LOGD(TAG, "Chunk %d sent via WebSocket (%zu bytes PCM)", chunk_index, pcm_len);
+        return true;
+    } else {
+        ESP_LOGE(TAG, "Failed to send chunk %d via WebSocket: %s", chunk_index, esp_err_to_name(err));
+        return false;
+    }
 }
 
 typedef struct {
@@ -239,167 +246,62 @@ static void proxy_stream_end_task(void *arg)
     proxy_stream_end_task_ctx_t *task_ctx = (proxy_stream_end_task_ctx_t *)arg;
     proxy_result_t result = PROXY_RESULT_FAILED;
 
-    // Base64 encode final chunk
-    size_t b64_len = 0;
-    size_t b64_buff_len = ((task_ctx->pcm_len + 2) / 3) * 4 + 1;
-    char *b64_output = proxy_alloc(b64_buff_len);
-    if (!b64_output) {
-        ESP_LOGE(TAG, "Failed to allocate base64 buffer for final chunk");
+    ESP_LOGI(TAG, "Sending final chunk %d via WebSocket (%zu bytes PCM)", task_ctx->chunk_index, task_ctx->pcm_len);
+
+    // Check WebSocket connection
+    if (!s_ws_connected) {
+        ESP_LOGE(TAG, "WebSocket not connected, cannot send final chunk");
         goto cleanup;
     }
 
-    int rc = mbedtls_base64_encode((unsigned char *)b64_output, b64_buff_len, &b64_len,
-                                  task_ctx->pcm_data, task_ctx->pcm_len);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Base64 encode failed for final chunk: %d", rc);
-        proxy_free(b64_output);
-        goto cleanup;
-    }
-    b64_output[b64_len] = '\0';
-
-    // Build JSON payload
-    const char *payload_fmt = "{"
-                              "\"session_id\":\"%s\","
-                              "\"chunk_index\":%d,"
-                              "\"pcm_base64\":\"%s\","
-                              "\"is_final\":true"
-                              "}";
-    const size_t payload_len = strlen(payload_fmt) + strlen(task_ctx->stream_ctx->session_id) + 20 + b64_len + 1;
-    char *payload = proxy_alloc(payload_len);
-    if (!payload) {
-        ESP_LOGE(TAG, "Failed to allocate JSON payload for final chunk");
-        proxy_free(b64_output);
-        goto cleanup;
-    }
-    snprintf(payload, payload_len, payload_fmt, task_ctx->stream_ctx->session_id, task_ctx->chunk_index, b64_output);
-    proxy_free(b64_output);
-
-    ESP_LOGI(TAG, "Sending final chunk %d (%zu bytes PCM)", task_ctx->chunk_index, task_ctx->pcm_len);
-
-    // Configure HTTP client for streaming response
-    esp_http_client_config_t config = {
-        .url = s_config.url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 60000,  // Longer timeout for streaming response
-        .buffer_size = 4096,  // Read buffer for streaming
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGE(TAG, "Failed to init HTTP client for final chunk");
-        proxy_free(payload);
-        goto cleanup;
-    }
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "X-Assistant-Token", s_config.token);
-
-    esp_err_t err = esp_http_client_open(client, strlen(payload));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open HTTP connection for final chunk: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        proxy_free(payload);
-        goto cleanup;
-    }
-
-    int wlen = esp_http_client_write(client, payload, strlen(payload));
-    proxy_free(payload);
-    if (wlen < 0) {
-        ESP_LOGE(TAG, "Failed to write final chunk request");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        goto cleanup;
-    }
-
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    ESP_LOGI(TAG, "Final chunk response: status=%d", status);
-
-    if (status != 200) {
-        ESP_LOGW(TAG, "Final chunk failed with status %d", status);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        goto cleanup;
-    }
-
-    // Start streaming playback - audio plays immediately as chunks arrive
+    // Playback and receiving should already be started from first chunk
+    // Now transition to PLAYING state since recording is done
+    ESP_LOGI(TAG, "Sending final chunk (playback already active)");
     assistant_set_state(ASSISTANT_STATE_PLAYING);
 
-    if (!audio_playback_stream_start()) {
-        ESP_LOGE(TAG, "Failed to start streaming playback");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
+    // Send final chunk (raw binary PCM) - proxy will echo immediately
+    esp_err_t err = ws_client_send_audio(task_ctx->pcm_data, task_ctx->pcm_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send final chunk via WebSocket: %s", esp_err_to_name(err));
         goto cleanup;
     }
 
-    // Read streaming response - raw binary PCM (no JSON, no base64!)
-    // Read buffer for binary chunks (4KB)
-    const size_t read_chunk_size = 4096;
-    uint8_t *read_buffer = malloc(read_chunk_size);
-    if (!read_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate read buffer");
-        audio_playback_stream_end();
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        goto cleanup;
-    }
+    ESP_LOGI(TAG, "Final chunk sent, waiting for response");
 
-    // Debug: Log response headers
-    int content_len = esp_http_client_get_content_length(client);
-    ESP_LOGI(TAG, "Response headers: status=%d content_len=%d", status, content_len);
+    // Wait for audio to complete (with timeout)
+    // TODO: Implement proper end-of-stream detection from proxy
+    const int max_wait_seconds = 30;
+    const int check_interval_ms = 100;
+    int elapsed_ms = 0;
+    size_t last_audio_bytes = 0;
+    int idle_checks = 0;
+    const int idle_threshold = 20;  // 2 seconds of no new audio = done
 
-    char *transfer_encoding = NULL;
-    esp_http_client_get_header(client, "Transfer-Encoding", &transfer_encoding);
-    if (transfer_encoding) {
-        ESP_LOGI(TAG, "Transfer-Encoding: %s", transfer_encoding);
-    }
+    while (elapsed_ms < (max_wait_seconds * 1000)) {
+        vTaskDelay(pdMS_TO_TICKS(check_interval_ms));
+        elapsed_ms += check_interval_ms;
 
-    ESP_LOGI(TAG, "Binary streaming started - reading raw PCM chunks");
-
-    size_t total_audio_bytes = 0;
-    int total_reads = 0;
-
-    while (true) {
-        // Read raw binary PCM chunk from HTTP response
-        int read_len = esp_http_client_read_response(client, (char *)read_buffer, read_chunk_size);
-        total_reads++;
-
-        if (read_len < 0) {
-            ESP_LOGE(TAG, "Failed to read streaming response");
-            break;
-        }
-        if (read_len == 0) {
-            ESP_LOGI(TAG, "End of binary stream after %d reads", total_reads);
-            break;  // End of stream
-        }
-
-        // Stream raw PCM chunk directly to audio playback (no JSON, no base64!)
-        if (audio_playback_stream_write(read_buffer, read_len)) {
-            total_audio_bytes += read_len;
-            if (total_reads % 10 == 0) {  // Log every 10th chunk to reduce spam
-                ESP_LOGI(TAG, "Read %d: streamed %zu bytes total", total_reads, total_audio_bytes);
+        // Check if we're still receiving audio
+        size_t current_audio_bytes = s_received_audio_bytes;
+        if (current_audio_bytes == last_audio_bytes) {
+            idle_checks++;
+            if (idle_checks >= idle_threshold) {
+                ESP_LOGI(TAG, "No new audio for %d checks, assuming complete (received %zu bytes total)",
+                         idle_checks, current_audio_bytes);
+                break;
             }
         } else {
-            ESP_LOGW(TAG, "Ring buffer full, dropped %d bytes", read_len);
+            idle_checks = 0;
+            last_audio_bytes = current_audio_bytes;
         }
-
-        vTaskDelay(1);  // Feed watchdog
     }
-
-    free(read_buffer);
 
     // End streaming playback
     audio_playback_stream_end();
+    s_ws_receiving_audio = false;
 
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    if (total_audio_bytes > 0) {
-        ESP_LOGI(TAG, "Streamed %zu bytes of PCM audio (24kHz mono) with immediate playback", total_audio_bytes);
-        result = PROXY_RESULT_OK;
-    } else {
-        ESP_LOGW(TAG, "No PCM audio received");
-    }
+    ESP_LOGI(TAG, "WebSocket audio streaming completed");
+    result = PROXY_RESULT_OK;
 
 cleanup:
     proxy_free(task_ctx->pcm_data);
