@@ -3,7 +3,6 @@ idf_component_register(
         "app_main.c"
         "audio_controller.c"
         "audio_playback.c"
-        "pcm_buffer.c"
         "proxy_client.c"
         "ui.c"
         "drivers/lcd/ST77916.c"

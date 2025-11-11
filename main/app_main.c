@@ -25,8 +25,8 @@ static assistant_status_t g_status = {
 };
 
 // Forward declarations
-static void command_callback(proxy_result_t result, void *user_ctx);
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx);
+static void command_callback(proxy_result_t result, void *user_ctx);
 
 // Streaming session state
 static proxy_stream_handle_t s_stream_handle = NULL;
@@ -49,16 +49,6 @@ static void playback_event_handler(audio_playback_event_t event, void *ctx)
         assistant_set_state(ASSISTANT_STATE_ERROR);
         break;
     }
-}
-
-static void capture_complete_handler(void *ctx)
-{
-    (void)ctx;
-    ESP_LOGI(TAG, "Auto-stop triggered, sending recording to proxy");
-
-    // When auto-stop occurs, send recording to proxy
-    assistant_set_state(ASSISTANT_STATE_SENDING);
-    proxy_send_recording(command_callback, NULL);
 }
 
 assistant_status_t assistant_get_status(void)
@@ -230,7 +220,6 @@ void app_main(void)
     audio_controller_init();
     audio_playback_init();
     audio_playback_set_callback(playback_event_handler, NULL);
-    audio_set_capture_complete_callback(capture_complete_handler, NULL);
     proxy_client_init();
     assistant_set_state(ASSISTANT_STATE_IDLE);
 
