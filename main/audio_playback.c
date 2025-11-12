@@ -29,8 +29,6 @@ static i2s_chan_handle_t s_tx_chan = NULL;
 static TaskHandle_t s_playback_task = NULL;
 static audio_playback_callback_t s_callback = NULL;
 static void *s_callback_ctx = NULL;
-static audio_playback_reference_cb_t s_reference_cb = NULL;
-static void *s_reference_ctx = NULL;
 static uint8_t s_volume = 100;  // Default volume 100%
 static bool s_streaming_active = false;
 
@@ -82,12 +80,6 @@ void audio_playback_set_callback(audio_playback_callback_t callback, void *user_
 {
     s_callback = callback;
     s_callback_ctx = user_ctx;
-}
-
-void audio_playback_set_reference_callback(audio_playback_reference_cb_t ref_cb, void *user_ctx)
-{
-    s_reference_cb = ref_cb;
-    s_reference_ctx = user_ctx;
 }
 
 void audio_playback_set_volume(uint8_t volume)
@@ -273,12 +265,6 @@ static void buffered_playback_task(void *arg)
             apply_volume((int16_t *)read_buffer, sample_count, s_volume);
             vRingbufferReturnItem(s_stream_buffer, item);
             item = read_buffer;
-        }
-
-        // Call reference callback for AEC (before sending to speaker)
-        // This provides the playback reference signal for echo cancellation
-        if (s_reference_cb) {
-            s_reference_cb((const int16_t *)item, item_size, s_reference_ctx);
         }
 
         // Write to I2S

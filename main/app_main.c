@@ -1,7 +1,6 @@
 #include "smart_assistant.h"
 #include "audio_controller.h"
 #include "audio_playback.h"
-#include "audio_aec_reference.h"
 #include "proxy_client.h"
 #include "websocket_client.h"
 #include "ui.h"
@@ -54,23 +53,6 @@ static void playback_event_handler(audio_playback_event_t event, void *ctx)
         assistant_set_state(ASSISTANT_STATE_ERROR);
         break;
     }
-}
-
-/**
- * @brief Playback reference callback for AEC
- *
- * Captures audio being played through the speaker and feeds it to the
- * AEC reference buffer for echo cancellation.
- */
-static void playback_reference_handler(const int16_t *pcm_data, size_t pcm_len, void *ctx)
-{
-    (void)ctx;
-
-    // Convert bytes to samples
-    size_t samples = pcm_len / sizeof(int16_t);
-
-    // Feed to AEC reference buffer (will downsample from 24kHz to 16kHz internally)
-    audio_aec_reference_feed(pcm_data, samples);
 }
 
 assistant_status_t assistant_get_status(void)
@@ -265,10 +247,9 @@ void app_main(void)
     initialise_wifi();
 
     ui_init(ui_event_handler, NULL);
-    audio_controller_init();  // Initializes AEC internally
+    audio_controller_init();
     audio_playback_init();
     audio_playback_set_callback(playback_event_handler, NULL);
-    audio_playback_set_reference_callback(playback_reference_handler, NULL);  // For AEC reference
     proxy_client_init(websocket_connected_handler, NULL, NULL);  // WebSocket callback for continuous streaming
     assistant_set_state(ASSISTANT_STATE_IDLE);
 

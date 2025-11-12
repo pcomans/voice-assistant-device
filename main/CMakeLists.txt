@@ -3,8 +3,6 @@ idf_component_register(
         "app_main.c"
         "audio_controller.c"
         "audio_playback.c"
-        "audio_aec.c"
-        "audio_aec_reference.c"
         "audio_resampler.c"
         "proxy_client.c"
         "websocket_client.c"
@@ -39,5 +37,4 @@ idf_component_register(
         esp_lcd
         driver
         esp_websocket_client
-        espressif__esp-sr
 )
