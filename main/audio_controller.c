@@ -1,9 +1,12 @@
 #include "audio_controller.h"
 #include "smart_assistant.h"
+#include "audio_aec.h"
+#include "audio_aec_reference.h"
 
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -11,7 +14,9 @@
 #define AUDIO_BITS_PER_SAMPLE    I2S_DATA_BIT_WIDTH_32BIT  // MEMS mic outputs 32-bit I2S data
 #define AUDIO_CHANNEL_COUNT      1
 #define AUDIO_FRAME_SAMPLES      256
-#define STREAMING_CHUNK_MS       100  // Send 100ms chunks for streaming
+
+// AEC configuration
+#define AEC_ENABLE               1     // Enable AEC processing
 
 static const char *TAG = "audio_ctrl";
 
@@ -19,6 +24,7 @@ static TaskHandle_t streaming_capture_task_handle = NULL;
 static i2s_chan_handle_t s_rx_chan = NULL;
 static audio_capture_chunk_cb_t s_chunk_cb = NULL;
 static void *s_chunk_ctx = NULL;
+static bool s_aec_initialized = false;
 
 static esp_err_t configure_i2s(void)
 {
@@ -68,14 +74,53 @@ static esp_err_t configure_i2s(void)
     return ESP_OK;
 }
 
+/**
+ * @brief Callback for cleaned audio from AEC (16kHz)
+ *
+ * Receives cleaned audio from AFE and forwards directly to proxy.
+ * Proxy handles resampling to 24kHz for OpenAI.
+ */
+static void cleaned_audio_callback(const int16_t *pcm_16khz, size_t samples_16khz, void *ctx)
+{
+    (void)ctx;
+
+    if (!s_chunk_cb || samples_16khz == 0) {
+        return;
+    }
+
+    // Forward 16kHz cleaned audio directly to proxy (no resampling needed)
+    size_t bytes = samples_16khz * sizeof(int16_t);
+    s_chunk_cb((const uint8_t *)pcm_16khz, bytes, s_chunk_ctx);
+}
+
 void audio_controller_init(void)
 {
     esp_err_t err = configure_i2s();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "I2S configuration failed: %d", err);
-    } else {
-        ESP_LOGI(TAG, "Audio controller initialised (I2S channel: %p)", (void*)s_rx_chan);
+        return;
     }
+
+    ESP_LOGI(TAG, "Audio controller initialised (I2S channel: %p)", (void*)s_rx_chan);
+
+#if AEC_ENABLE
+    // Initialize AEC reference buffer (500ms buffer for playback reference)
+    if (!audio_aec_reference_init(500)) {
+        ESP_LOGE(TAG, "Failed to initialize AEC reference buffer");
+        return;
+    }
+
+    // Initialize AEC with cleaned audio callback
+    if (!audio_aec_init(cleaned_audio_callback, NULL)) {
+        ESP_LOGE(TAG, "Failed to initialize AEC");
+        return;
+    }
+
+    s_aec_initialized = true;
+    size_t chunk_size = audio_aec_get_chunk_size();
+    ESP_LOGI(TAG, "AEC initialized (chunk size: %zu samples/channel, %.1f ms @ 16kHz)",
+             chunk_size, (chunk_size * 1000.0f) / 16000.0f);
+#endif
 }
 
 static void streaming_capture_task(void *arg)
@@ -90,25 +135,36 @@ static void streaming_capture_task(void *arg)
         return;
     }
 
-    // Calculate chunk size for 100ms at 16kHz, 16-bit PCM
-    const size_t chunk_samples = (AUDIO_SAMPLE_RATE_HZ * STREAMING_CHUNK_MS) / 1000;
-    const size_t chunk_bytes = chunk_samples * sizeof(int16_t);  // 3200 bytes for 100ms
+#if AEC_ENABLE
+    // Get AEC chunk size (typically 512 samples @ 16kHz = 32ms chunks)
+    size_t aec_chunk_size = s_aec_initialized ? audio_aec_get_chunk_size() : 0;
+    if (aec_chunk_size == 0) {
+        ESP_LOGE(TAG, "AEC not initialized or invalid chunk size");
+        streaming_capture_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
-    // Buffers for I2S and PCM conversion
-    int32_t *i2s_buffer = malloc(chunk_samples * sizeof(int32_t));
-    int16_t *pcm_chunk = malloc(chunk_bytes);
+    ESP_LOGI(TAG, "Using AEC chunk size: %zu samples/channel (%.1f ms @ 16kHz)",
+             aec_chunk_size, (aec_chunk_size * 1000.0f) / 16000.0f);
 
-    if (!i2s_buffer || !pcm_chunk) {
+    // Allocate buffers
+    int32_t *i2s_buffer = heap_caps_malloc(AUDIO_FRAME_SAMPLES * sizeof(int32_t), MALLOC_CAP_INTERNAL);
+    int16_t *mic_buffer = heap_caps_malloc(aec_chunk_size * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+    int16_t *ref_buffer = heap_caps_malloc(aec_chunk_size * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+
+    if (!i2s_buffer || !mic_buffer || !ref_buffer) {
         ESP_LOGE(TAG, "Failed to allocate streaming buffers");
         if (i2s_buffer) free(i2s_buffer);
-        if (pcm_chunk) free(pcm_chunk);
+        if (mic_buffer) free(mic_buffer);
+        if (ref_buffer) free(ref_buffer);
         streaming_capture_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
     size_t samples_in_chunk = 0;
-    int frames_read = 0;
+    int chunks_processed = 0;
 
     // Stream continuously until task is stopped
     while (streaming_capture_task_handle != NULL) {
@@ -122,9 +178,66 @@ static void streaming_capture_task(void *arg)
             continue;
         }
 
-        frames_read++;
-
         // Convert 32-bit I2S to 16-bit PCM
+        size_t samples_read = bytes_read / sizeof(int32_t);
+        for (size_t i = 0; i < samples_read; i++) {
+            if (samples_in_chunk < aec_chunk_size) {
+                mic_buffer[samples_in_chunk++] = (int16_t)(i2s_buffer[i] >> 14);
+            }
+        }
+
+        // When chunk is full, process through AEC
+        if (samples_in_chunk >= aec_chunk_size) {
+            // Get reference samples (playback audio for echo cancellation)
+            audio_aec_reference_get(ref_buffer, aec_chunk_size);
+
+            // Process through AEC (cleaned audio will be sent via callback)
+            if (!audio_aec_process(mic_buffer, ref_buffer, aec_chunk_size)) {
+                ESP_LOGW(TAG, "AEC processing failed");
+            }
+
+            samples_in_chunk = 0;  // Reset for next chunk
+            chunks_processed++;
+
+            // Yield to prevent watchdog timeout (AEC processing is CPU intensive)
+            taskYIELD();
+        }
+    }
+
+    ESP_LOGI(TAG, "Streaming capture task exit (chunks processed: %d)", chunks_processed);
+
+    free(i2s_buffer);
+    free(mic_buffer);
+    free(ref_buffer);
+
+#else
+    // Original non-AEC path (fallback)
+    const size_t chunk_samples = 1600;  // 100ms @ 16kHz
+    const size_t chunk_bytes = chunk_samples * sizeof(int16_t);
+
+    int32_t *i2s_buffer = malloc(chunk_samples * sizeof(int32_t));
+    int16_t *pcm_chunk = malloc(chunk_bytes);
+
+    if (!i2s_buffer || !pcm_chunk) {
+        ESP_LOGE(TAG, "Failed to allocate streaming buffers");
+        if (i2s_buffer) free(i2s_buffer);
+        if (pcm_chunk) free(pcm_chunk);
+        streaming_capture_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t samples_in_chunk = 0;
+
+    while (streaming_capture_task_handle != NULL) {
+        size_t bytes_read = 0;
+        size_t i2s_bytes = AUDIO_FRAME_SAMPLES * sizeof(int32_t);
+        esp_err_t err = i2s_channel_read(s_rx_chan, i2s_buffer, i2s_bytes, &bytes_read, portMAX_DELAY);
+
+        if (err != ESP_OK || bytes_read == 0) {
+            continue;
+        }
+
         size_t samples_read = bytes_read / sizeof(int32_t);
         for (size_t i = 0; i < samples_read; i++) {
             if (samples_in_chunk < chunk_samples) {
@@ -132,25 +245,18 @@ static void streaming_capture_task(void *arg)
             }
         }
 
-        // When chunk is full, send it via callback
         if (samples_in_chunk >= chunk_samples) {
             if (s_chunk_cb) {
                 s_chunk_cb((const uint8_t *)pcm_chunk, chunk_bytes, s_chunk_ctx);
             }
-            samples_in_chunk = 0;  // Reset for next chunk
+            samples_in_chunk = 0;
         }
-    }
-
-    // Send final empty chunk to signal end of streaming
-    if (s_chunk_cb) {
-        ESP_LOGI(TAG, "Sending final empty chunk to signal end of streaming");
-        s_chunk_cb(NULL, 0, s_chunk_ctx);
     }
 
     free(i2s_buffer);
     free(pcm_chunk);
+#endif
 
-    ESP_LOGI(TAG, "Streaming capture task exit (frames read: %d)", frames_read);
     streaming_capture_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -166,7 +272,9 @@ void audio_start_streaming_capture(audio_capture_chunk_cb_t chunk_cb, void *ctx)
     s_chunk_ctx = ctx;
 
     ESP_LOGI(TAG, "Starting streaming audio capture (100ms chunks)");
-    xTaskCreatePinnedToCore(streaming_capture_task, "audio_stream", 4096, NULL, 5, &streaming_capture_task_handle, 0);
+    // Increased stack size for AEC processing (needs ~3KB for buffers + AEC overhead)
+    // Pin to core 1 (same as fetch task) and lower priority to avoid starving IDLE task
+    xTaskCreatePinnedToCore(streaming_capture_task, "audio_stream", 8192, NULL, 4, &streaming_capture_task_handle, 1);
 }
 
 void audio_stop_streaming_capture(void)
@@ -178,7 +286,6 @@ void audio_stop_streaming_capture(void)
     ESP_LOGI(TAG, "Stopping streaming capture");
 
     // Clear task handle to signal task to exit
-    TaskHandle_t task = streaming_capture_task_handle;
     streaming_capture_task_handle = NULL;
 
     // Wait a bit for task to exit gracefully

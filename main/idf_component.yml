@@ -18,3 +18,4 @@ dependencies:
   lvgl/lvgl: ^8
   espressif/esp_audio_codec: ^2.3.0
   espressif/esp_websocket_client: '*'
+  espressif/esp-sr: ^2.1.5

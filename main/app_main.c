@@ -1,6 +1,7 @@
 #include "smart_assistant.h"
 #include "audio_controller.h"
 #include "audio_playback.h"
+#include "audio_aec_reference.h"
 #include "proxy_client.h"
 #include "websocket_client.h"
 #include "ui.h"
@@ -25,9 +26,6 @@ static assistant_status_t g_status = {
     .proxy_connected = false,
 };
 
-// Mic muting state (to prevent echo when assistant is speaking)
-static bool g_mic_muted_for_speech = false;
-
 // Forward declarations
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx);
 
@@ -48,6 +46,23 @@ static void playback_event_handler(audio_playback_event_t event, void *ctx)
         assistant_set_state(ASSISTANT_STATE_ERROR);
         break;
     }
+}
+
+/**
+ * @brief Playback reference callback for AEC
+ *
+ * Captures audio being played through the speaker and feeds it to the
+ * AEC reference buffer for echo cancellation.
+ */
+static void playback_reference_handler(const int16_t *pcm_data, size_t pcm_len, void *ctx)
+{
+    (void)ctx;
+
+    // Convert bytes to samples
+    size_t samples = pcm_len / sizeof(int16_t);
+
+    // Feed to AEC reference buffer (will downsample from 24kHz to 16kHz internally)
+    audio_aec_reference_feed(pcm_data, samples);
 }
 
 assistant_status_t assistant_get_status(void)
@@ -117,32 +132,13 @@ static void initialise_wifi(void)
     ESP_LOGI(TAG, "Wi-Fi initialised; configure SSID/password in NVS UI");
 }
 
-static void speech_event_handler(bool is_speaking, void *ctx)
-{
-    (void)ctx;
-
-    if (is_speaking) {
-        ESP_LOGI(TAG, "Assistant started speaking - muting microphone to prevent echo");
-        g_mic_muted_for_speech = true;
-    } else {
-        ESP_LOGI(TAG, "Assistant stopped speaking - unmuting microphone");
-        g_mic_muted_for_speech = false;
-    }
-}
-
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx)
 {
     (void)ctx;
 
-    // Skip sending audio if muted due to assistant speaking (prevents echo)
-    if (g_mic_muted_for_speech) {
-        ESP_LOGD(TAG, "Mic muted for speech - skipping %zu bytes", pcm_len);
-        return;
-    }
-
-    // Forward audio chunks directly to WebSocket
-    // With server-side VAD, OpenAI will detect when user stops speaking
-    // We don't send empty frames - just stop sending audio when muted
+    // Forward AEC-cleaned audio chunks directly to WebSocket (16kHz)
+    // Proxy will resample to 24kHz for OpenAI
+    // AEC handles echo cancellation, so no manual mic muting needed
     if (pcm_len > 0) {
         esp_err_t err = ws_client_send_audio(pcm_data, pcm_len);
         if (err != ESP_OK) {
@@ -213,10 +209,11 @@ void app_main(void)
     initialise_wifi();
 
     ui_init(ui_event_handler, NULL);
-    audio_controller_init();
+    audio_controller_init();  // Initializes AEC internally
     audio_playback_init();
     audio_playback_set_callback(playback_event_handler, NULL);
-    proxy_client_init(speech_event_handler, NULL);  // Pass speech event handler for mic muting
+    audio_playback_set_reference_callback(playback_reference_handler, NULL);  // For AEC reference
+    proxy_client_init(NULL, NULL);  // No speech event handler needed with AEC
     assistant_set_state(ASSISTANT_STATE_IDLE);
 
     // Create LVGL task to periodically update the display
