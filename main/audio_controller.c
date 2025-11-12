@@ -110,7 +110,8 @@ static void streaming_capture_task(void *arg)
     size_t samples_in_chunk = 0;
     int frames_read = 0;
 
-    while (assistant_get_status().state == ASSISTANT_STATE_RECORDING) {
+    // Stream continuously until task is stopped
+    while (streaming_capture_task_handle != NULL) {
         // Read I2S data in smaller frames
         size_t bytes_read = 0;
         size_t i2s_bytes = AUDIO_FRAME_SAMPLES * sizeof(int32_t);
@@ -140,16 +141,10 @@ static void streaming_capture_task(void *arg)
         }
     }
 
-    // ALWAYS send a final chunk (even if empty) to signal end of recording
-    // The handler uses state change to detect this is the final chunk
+    // Send final empty chunk to signal end of streaming
     if (s_chunk_cb) {
-        size_t remaining_bytes = samples_in_chunk * sizeof(int16_t);
-        if (remaining_bytes > 0) {
-            ESP_LOGI(TAG, "Sending final partial chunk: %zu samples (%zu bytes)", samples_in_chunk, remaining_bytes);
-        } else {
-            ESP_LOGI(TAG, "Sending final empty chunk to signal end of recording");
-        }
-        s_chunk_cb((const uint8_t *)pcm_chunk, remaining_bytes, s_chunk_ctx);
+        ESP_LOGI(TAG, "Sending final empty chunk to signal end of streaming");
+        s_chunk_cb(NULL, 0, s_chunk_ctx);
     }
 
     free(i2s_buffer);
@@ -181,5 +176,11 @@ void audio_stop_streaming_capture(void)
         return;
     }
     ESP_LOGI(TAG, "Stopping streaming capture");
-    // The task checks the state and exits
+
+    // Clear task handle to signal task to exit
+    TaskHandle_t task = streaming_capture_task_handle;
+    streaming_capture_task_handle = NULL;
+
+    // Wait a bit for task to exit gracefully
+    vTaskDelay(pdMS_TO_TICKS(50));
 }

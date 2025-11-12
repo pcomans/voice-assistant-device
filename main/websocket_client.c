@@ -46,13 +46,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
 
     case WEBSOCKET_EVENT_DATA:
-        ESP_LOGI(TAG, "WebSocket data received: %d bytes (offset=%d, payload_len=%d, fin=%d, opcode=0x%02x)",
+        ESP_LOGD(TAG, "WebSocket data received: %d bytes (offset=%d, payload_len=%d, fin=%d, opcode=0x%02x)",
                  data->data_len, data->payload_offset, data->payload_len, data->fin, data->op_code);
 
-        // Only handle binary frames (audio data)
-        if (data->op_code == 0x02) {  // Binary frame
+        // Handle different WebSocket frame types
+        if (data->op_code == 0x02) {  // Binary frame (audio data)
             if (s_audio_cb && data->data_ptr && data->data_len > 0) {
-                ESP_LOGI(TAG, "Calling audio callback with %d bytes (offset=%d/%d)",
+                ESP_LOGD(TAG, "Calling audio callback with %d bytes (offset=%d/%d)",
                          data->data_len, data->payload_offset, data->payload_len);
                 s_audio_cb((const uint8_t *)data->data_ptr, data->data_len, s_user_ctx);
             } else {
@@ -60,6 +60,12 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             }
         } else if (data->op_code == 0x01) {  // Text frame
             ESP_LOGD(TAG, "Received text message: %.*s", data->data_len, (char *)data->data_ptr);
+        } else if (data->op_code == 0x08) {  // Close frame
+            ESP_LOGD(TAG, "Received WebSocket close frame");
+        } else if (data->op_code == 0x09) {  // Ping frame
+            ESP_LOGD(TAG, "Received WebSocket ping frame");
+        } else if (data->op_code == 0x0a) {  // Pong frame
+            ESP_LOGD(TAG, "Received WebSocket pong frame (keepalive)");
         } else {
             ESP_LOGW(TAG, "Unknown opcode: 0x%02x", data->op_code);
         }
@@ -171,10 +177,6 @@ esp_err_t ws_client_send_audio(const uint8_t *data, size_t len)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!data || len == 0) {
-        return ESP_OK;  // Empty chunk, skip
-    }
-
     // Check connection state
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     bool connected = s_connected;
@@ -186,13 +188,18 @@ esp_err_t ws_client_send_audio(const uint8_t *data, size_t len)
     }
 
     // Send binary frame (opcode 0x02) with timeout to prevent blocking
+    // Empty frames (len=0) are sent to signal end of turn to the proxy
     int ret = esp_websocket_client_send_bin(s_client, (const char *)data, len, pdMS_TO_TICKS(5000));
     if (ret < 0) {
         ESP_LOGE(TAG, "Failed to send WebSocket data (timeout or network error)");
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGD(TAG, "Sent %d bytes via WebSocket", ret);
+    if (len == 0) {
+        ESP_LOGI(TAG, "Sent empty frame to signal end of turn");
+    } else {
+        ESP_LOGD(TAG, "Sent %d bytes via WebSocket", ret);
+    }
     return ESP_OK;
 }
 

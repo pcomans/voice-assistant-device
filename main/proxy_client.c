@@ -108,15 +108,9 @@ generate_new:
 // WebSocket callbacks
 static void ws_audio_received_handler(const uint8_t *data, size_t len, void *user_ctx)
 {
-    if (!s_ws_receiving_audio) {
-        ESP_LOGD(TAG, "Ignoring audio data (not in receiving mode)");
-        return;
-    }
-
-    // Stream audio directly to playback
+    // Stream audio directly to playback (always enabled in continuous streaming mode)
     if (audio_playback_stream_write(data, len)) {
-        s_received_audio_bytes += len;
-        ESP_LOGD(TAG, "Streamed %zu bytes to playback (total: %zu)", len, s_received_audio_bytes);
+        ESP_LOGD(TAG, "Streamed %zu bytes to playback", len);
     } else {
         ESP_LOGW(TAG, "Ring buffer full, dropped %zu bytes", len);
     }
@@ -255,9 +249,8 @@ static void proxy_stream_end_task(void *arg)
     }
 
     // Playback and receiving should already be started from first chunk
-    // Now transition to PLAYING state since recording is done
+    // NOTE: This code path is no longer used - keeping for compatibility
     ESP_LOGI(TAG, "Sending final chunk (playback already active)");
-    assistant_set_state(ASSISTANT_STATE_PLAYING);
 
     // Send final chunk (raw binary PCM) - proxy will echo immediately
     esp_err_t err = ws_client_send_audio(task_ctx->pcm_data, task_ctx->pcm_len);

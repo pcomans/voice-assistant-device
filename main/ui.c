@@ -21,7 +21,7 @@ static void button_event_cb(lv_event_t *event)
 
     assistant_status_t status = assistant_get_status();
     ui_event_t ui_event = {
-        .type = (status.state == ASSISTANT_STATE_RECORDING) ? UI_EVENT_RECORD_STOP : UI_EVENT_RECORD_START,
+        .type = (status.state == ASSISTANT_STATE_STREAMING) ? UI_EVENT_RECORD_STOP : UI_EVENT_RECORD_START,
     };
 
     s_event_cb(&ui_event, s_event_ctx);
@@ -45,7 +45,7 @@ void ui_init(ui_event_cb_t cb, void *user_ctx)
     lv_obj_add_event_cb(s_button, button_event_cb, LV_EVENT_CLICKED, NULL);
 
     s_label = lv_label_create(s_button);
-    lv_label_set_text(s_label, "Start Recording");
+    lv_label_set_text(s_label, "Unmute");
     lv_obj_center(s_label);
 
     // Make label text 2x bigger
@@ -66,19 +66,12 @@ void ui_update_state(assistant_status_t status)
     const char *text = NULL;
     switch (status.state) {
     case ASSISTANT_STATE_IDLE:
-        text = "Start Recording";
+        text = "Unmute";
         lv_obj_clear_state(s_button, LV_STATE_DISABLED);
         break;
-    case ASSISTANT_STATE_RECORDING:
-        text = "Stop Recording";
-        break;
-    case ASSISTANT_STATE_SENDING:
-        text = "Sending…";
-        lv_obj_add_state(s_button, LV_STATE_DISABLED);
-        break;
-    case ASSISTANT_STATE_PLAYING:
-        text = "Playing";
-        lv_obj_add_state(s_button, LV_STATE_DISABLED);
+    case ASSISTANT_STATE_STREAMING:
+        text = "Mute";
+        lv_obj_clear_state(s_button, LV_STATE_DISABLED);
         break;
     case ASSISTANT_STATE_ERROR:
     default:

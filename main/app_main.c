@@ -2,6 +2,7 @@
 #include "audio_controller.h"
 #include "audio_playback.h"
 #include "proxy_client.h"
+#include "websocket_client.h"
 #include "ui.h"
 #include "wifi_credentials.h"
 
@@ -26,11 +27,6 @@ static assistant_status_t g_status = {
 
 // Forward declarations
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx);
-static void command_callback(proxy_result_t result, void *user_ctx);
-
-// Streaming session state
-static proxy_stream_handle_t s_stream_handle = NULL;
-static int s_chunk_index = 0;
 
 static void playback_event_handler(audio_playback_event_t event, void *ctx)
 {
@@ -42,7 +38,7 @@ static void playback_event_handler(audio_playback_event_t event, void *ctx)
         break;
     case AUDIO_PLAYBACK_EVENT_COMPLETED:
         ESP_LOGI(TAG, "Playback completed");
-        assistant_set_state(ASSISTANT_STATE_IDLE);
+        // No state change needed - can stay in STREAMING if mic still unmuted
         break;
     case AUDIO_PLAYBACK_EVENT_ERROR:
         ESP_LOGE(TAG, "Playback error");
@@ -118,48 +114,17 @@ static void initialise_wifi(void)
     ESP_LOGI(TAG, "Wi-Fi initialised; configure SSID/password in NVS UI");
 }
 
-static void command_callback(proxy_result_t result, void *user_ctx)
-{
-    (void)user_ctx;
-
-    assistant_state_t next_state = ASSISTANT_STATE_IDLE;
-    if (result == PROXY_RESULT_RETRY) {
-        next_state = ASSISTANT_STATE_SENDING;
-    } else if (result == PROXY_RESULT_FAILED) {
-        next_state = ASSISTANT_STATE_ERROR;
-    }
-
-    assistant_set_state(next_state);
-}
-
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx)
 {
     (void)ctx;
 
-    assistant_state_t current_state = assistant_get_status().state;
-    ESP_LOGI(TAG, "streaming_chunk_handler: chunk_index=%d len=%zu state=%d handle=%p",
-             s_chunk_index, pcm_len, current_state, s_stream_handle);
-
-    if (!s_stream_handle) {
-        ESP_LOGW(TAG, "No stream handle, ignoring chunk");
-        return;
-    }
-
-    // Check if this is the final chunk (recording stopped)
-    if (current_state != ASSISTANT_STATE_RECORDING) {
-        // Send final chunk via proxy_stream_end
-        ESP_LOGI(TAG, "Sending final chunk %d (%zu bytes)", s_chunk_index, pcm_len);
-        proxy_stream_end(s_stream_handle, pcm_data, pcm_len, s_chunk_index, command_callback, NULL);
-        s_stream_handle = NULL;
-        s_chunk_index = 0;
-    } else {
-        // Send non-final chunk via proxy_stream_send_chunk
-        bool success = proxy_stream_send_chunk(s_stream_handle, pcm_data, pcm_len, s_chunk_index);
-        if (success) {
-            ESP_LOGI(TAG, "Sent non-final chunk %d (%zu bytes)", s_chunk_index, pcm_len);
-            s_chunk_index++;
-        } else {
-            ESP_LOGE(TAG, "Failed to send chunk %d", s_chunk_index);
+    // Simply forward audio chunks directly to WebSocket
+    // With server-side VAD, OpenAI will detect when user stops speaking
+    // We don't send empty frames - just stop sending audio when muted
+    if (pcm_len > 0) {
+        esp_err_t err = ws_client_send_audio(pcm_data, pcm_len);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send audio chunk: %s", esp_err_to_name(err));
         }
     }
 }
@@ -171,28 +136,34 @@ static void ui_event_handler(const ui_event_t *event, void *ctx)
     switch (event->type) {
     case UI_EVENT_RECORD_START:
         if (!assistant_get_status().wifi_connected) {
-            ESP_LOGW(TAG, "Cannot start recording: Wi-Fi not connected");
+            ESP_LOGW(TAG, "Cannot start streaming: Wi-Fi not connected");
             break;
         }
         if (assistant_get_status().state == ASSISTANT_STATE_IDLE) {
-            // Start streaming session with persistent session ID
-            const char *session_id = proxy_get_session_id();
-            s_stream_handle = proxy_stream_begin(session_id);
-            if (!s_stream_handle) {
-                ESP_LOGE(TAG, "Failed to start streaming session");
+            ESP_LOGI(TAG, "Unmuting microphone - starting continuous streaming");
+
+            // Stop any previous playback stream and start fresh
+            audio_playback_stream_end();
+
+            // Start playback stream to receive OpenAI responses
+            if (!audio_playback_stream_start()) {
+                ESP_LOGE(TAG, "Failed to start playback stream");
                 break;
             }
-            s_chunk_index = 0;
 
-            assistant_set_state(ASSISTANT_STATE_RECORDING);
+            assistant_set_state(ASSISTANT_STATE_STREAMING);
             audio_start_streaming_capture(streaming_chunk_handler, NULL);
         }
         break;
     case UI_EVENT_RECORD_STOP:
-        if (assistant_get_status().state == ASSISTANT_STATE_RECORDING) {
-            assistant_set_state(ASSISTANT_STATE_SENDING);
+        if (assistant_get_status().state == ASSISTANT_STATE_STREAMING) {
+            ESP_LOGI(TAG, "Muting microphone - stopping streaming");
+            assistant_set_state(ASSISTANT_STATE_IDLE);
             audio_stop_streaming_capture();
-            // Note: Final chunk will be sent by streaming_chunk_handler when task exits
+            // Final empty chunk will be sent by audio_controller.c
+
+            // Keep playback stream open to let assistant finish speaking
+            // It will be stopped when starting a new streaming session
         }
         break;
     default:

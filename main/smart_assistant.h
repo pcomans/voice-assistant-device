@@ -4,9 +4,7 @@
 
 typedef enum {
     ASSISTANT_STATE_IDLE = 0,
-    ASSISTANT_STATE_RECORDING,
-    ASSISTANT_STATE_SENDING,
-    ASSISTANT_STATE_PLAYING,
+    ASSISTANT_STATE_STREAMING,  // Microphone unmuted, bidirectional audio streaming
     ASSISTANT_STATE_ERROR,
 } assistant_state_t;
 
