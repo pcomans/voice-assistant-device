@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "cJSON.h"
 #include <string.h>
 
 static const char *TAG = "ws_client";
@@ -11,6 +12,7 @@ static const char *TAG = "ws_client";
 static esp_websocket_client_handle_t s_client = NULL;
 static ws_audio_received_cb_t s_audio_cb = NULL;
 static ws_state_change_cb_t s_state_cb = NULL;
+static ws_speech_event_cb_t s_speech_cb = NULL;
 static void *s_user_ctx = NULL;
 static bool s_connected = false;
 static SemaphoreHandle_t s_state_mutex = NULL;
@@ -58,8 +60,30 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             } else {
                 ESP_LOGW(TAG, "Binary frame but no callback or empty data");
             }
-        } else if (data->op_code == 0x01) {  // Text frame
-            ESP_LOGD(TAG, "Received text message: %.*s", data->data_len, (char *)data->data_ptr);
+        } else if (data->op_code == 0x01) {  // Text frame (control messages)
+            if (data->data_ptr && data->data_len > 0) {
+                ESP_LOGD(TAG, "Received text message: %.*s", data->data_len, (char *)data->data_ptr);
+
+                // Parse JSON control message using cJSON
+                if (s_speech_cb) {
+                    cJSON *json = cJSON_ParseWithLength((char *)data->data_ptr, data->data_len);
+                    if (json != NULL) {
+                        cJSON *type = cJSON_GetObjectItem(json, "type");
+                        if (cJSON_IsString(type) && type->valuestring != NULL) {
+                            if (strcmp(type->valuestring, "speech_start") == 0) {
+                                ESP_LOGI(TAG, "Assistant started speaking");
+                                s_speech_cb(true, s_user_ctx);
+                            } else if (strcmp(type->valuestring, "speech_end") == 0) {
+                                ESP_LOGI(TAG, "Assistant stopped speaking");
+                                s_speech_cb(false, s_user_ctx);
+                            }
+                        }
+                        cJSON_Delete(json);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to parse JSON control message");
+                    }
+                }
+            }
         } else if (data->op_code == 0x08) {  // Close frame
             ESP_LOGD(TAG, "Received WebSocket close frame");
         } else if (data->op_code == 0x09) {  // Ping frame
@@ -91,6 +115,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 esp_err_t ws_client_init(const char *uri,
                           ws_audio_received_cb_t audio_cb,
                           ws_state_change_cb_t state_cb,
+                          ws_speech_event_cb_t speech_cb,
                           void *user_ctx)
 {
     if (!uri) {
@@ -113,6 +138,7 @@ esp_err_t ws_client_init(const char *uri,
     // Store callbacks
     s_audio_cb = audio_cb;
     s_state_cb = state_cb;
+    s_speech_cb = speech_cb;
     s_user_ctx = user_ctx;
     s_connected = false;
 
@@ -253,6 +279,7 @@ esp_err_t ws_client_destroy(void)
     s_client = NULL;
     s_audio_cb = NULL;
     s_state_cb = NULL;
+    s_speech_cb = NULL;
     s_user_ctx = NULL;
 
     if (s_state_mutex) {

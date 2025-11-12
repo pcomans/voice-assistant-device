@@ -23,17 +23,27 @@ typedef void (*ws_audio_received_cb_t)(const uint8_t *data, size_t len, void *us
 typedef void (*ws_state_change_cb_t)(bool connected, void *user_ctx);
 
 /**
+ * @brief Callback for assistant speech events (start/end)
+ *
+ * @param is_speaking true when assistant starts speaking, false when it finishes
+ * @param user_ctx User context pointer passed during init
+ */
+typedef void (*ws_speech_event_cb_t)(bool is_speaking, void *user_ctx);
+
+/**
  * @brief Initialize WebSocket client
  *
  * @param uri WebSocket URI (e.g., "ws://192.168.7.75:8000/ws")
  * @param audio_cb Callback for received audio data
  * @param state_cb Callback for connection state changes
+ * @param speech_cb Callback for assistant speech events (can be NULL)
  * @param user_ctx User context passed to callbacks
  * @return ESP_OK on success
  */
 esp_err_t ws_client_init(const char *uri,
                           ws_audio_received_cb_t audio_cb,
                           ws_state_change_cb_t state_cb,
+                          ws_speech_event_cb_t speech_cb,
                           void *user_ctx);
 
 /**

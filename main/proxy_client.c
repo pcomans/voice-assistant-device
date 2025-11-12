@@ -127,13 +127,13 @@ static void ws_state_change_handler(bool connected, void *user_ctx)
     }
 }
 
-void proxy_client_init(void)
+void proxy_client_init(proxy_speech_event_cb_t speech_cb, void *user_ctx)
 {
     load_or_create_session_id();
     ESP_LOGI(TAG, "Proxy client initialised using %s (session: %s)", s_config.url, s_config.session_id);
 
     // Initialize WebSocket client (but don't connect yet - wait for WiFi)
-    esp_err_t err = ws_client_init(s_config.url, ws_audio_received_handler, ws_state_change_handler, NULL);
+    esp_err_t err = ws_client_init(s_config.url, ws_audio_received_handler, ws_state_change_handler, speech_cb, user_ctx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize WebSocket client: %s", esp_err_to_name(err));
         return;
