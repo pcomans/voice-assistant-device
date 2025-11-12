@@ -21,12 +21,21 @@ typedef void (*proxy_result_cb_t)(proxy_result_t result, void *user_ctx);
 typedef void (*proxy_speech_event_cb_t)(bool is_speaking, void *user_ctx);
 
 /**
+ * @brief Callback for WebSocket connection state changes
+ *
+ * @param connected true when WebSocket connects, false when it disconnects
+ * @param user_ctx User context pointer
+ */
+typedef void (*proxy_ws_state_cb_t)(bool connected, void *user_ctx);
+
+/**
  * @brief Initialize proxy client
  *
+ * @param ws_state_cb Callback for WebSocket connection state (can be NULL)
  * @param speech_cb Callback for assistant speech events (can be NULL)
- * @param user_ctx User context passed to speech callback
+ * @param user_ctx User context passed to callbacks
  */
-void proxy_client_init(proxy_speech_event_cb_t speech_cb, void *user_ctx);
+void proxy_client_init(proxy_ws_state_cb_t ws_state_cb, proxy_speech_event_cb_t speech_cb, void *user_ctx);
 
 // Connect to proxy (call after WiFi is connected)
 void proxy_client_connect(void);

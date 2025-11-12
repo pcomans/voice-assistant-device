@@ -28,7 +28,8 @@ static void *s_user_ctx = NULL;
 static int16_t *s_feed_buffer = NULL;
 
 // Queue for decoupling AFE fetch from WebSocket I/O
-#define AUDIO_QUEUE_LENGTH 10
+// 50 chunks @ 8ms/chunk = 400ms buffer to handle WebSocket latency spikes
+#define AUDIO_QUEUE_LENGTH 50
 typedef struct {
     int16_t *data;
     size_t size;
@@ -42,26 +43,79 @@ static bool s_running = false;
 
 /**
  * @brief Output task - reads from queue and calls user callback (with blocking I/O)
+ *
+ * Accumulates multiple small AEC chunks into larger buffers before sending to WebSocket.
+ * This prevents overwhelming the WebSocket layer with 125 tiny sends/second.
  */
 static void output_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "Output task started on core %d", xPortGetCoreID());
 
-    audio_chunk_t chunk;
-    while (s_running) {
-        // Wait for audio chunk from queue (blocking)
-        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // Call user callback (may do blocking WebSocket I/O)
-            if (s_output_cb && chunk.data && chunk.size > 0) {
-                s_output_cb(chunk.data, chunk.size, s_user_ctx);
-            }
+    // Accumulation buffer to batch multiple AEC chunks before sending
+    // Target: ~100ms worth of audio (1600 samples @ 16kHz = 3200 bytes)
+    // Each AEC chunk is 128 samples (256 bytes), so accumulate ~12 chunks
+    const size_t accumulation_buffer_size = 4096;  // ~16 chunks max
+    int16_t *accumulation_buffer = heap_caps_malloc(accumulation_buffer_size, MALLOC_CAP_SPIRAM);
+    if (!accumulation_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate accumulation buffer");
+        s_output_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
-            // Free the allocated chunk data
-            if (chunk.data) {
-                free(chunk.data);
+    size_t accumulated_bytes = 0;
+    audio_chunk_t chunk;
+
+    while (s_running) {
+        // Try to accumulate chunks from queue (non-blocking)
+        bool got_chunk = false;
+        for (int i = 0; i < 12; i++) {  // Try to get up to 12 chunks (≈100ms)
+            if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(10)) == pdTRUE) {
+                got_chunk = true;
+
+                // Copy chunk data to accumulation buffer
+                if (chunk.data && chunk.size > 0) {
+                    size_t copy_size = chunk.size;
+                    if (accumulated_bytes + copy_size > accumulation_buffer_size) {
+                        copy_size = accumulation_buffer_size - accumulated_bytes;
+                        ESP_LOGW(TAG, "Accumulation buffer full, truncating chunk");
+                    }
+
+                    memcpy((uint8_t *)accumulation_buffer + accumulated_bytes, chunk.data, copy_size);
+                    accumulated_bytes += copy_size;
+                }
+
+                // Free the chunk
+                if (chunk.data) {
+                    free(chunk.data);
+                }
+
+                // If buffer is full, stop accumulating and send
+                if (accumulated_bytes >= 3000) {  // ~100ms worth
+                    break;
+                }
+            } else {
+                // No more chunks in queue, send what we have
+                break;
             }
         }
+
+        // Send accumulated buffer if we have data
+        if (accumulated_bytes > 0) {
+            if (s_output_cb) {
+                s_output_cb((const int16_t *)accumulation_buffer, accumulated_bytes / sizeof(int16_t), s_user_ctx);
+            }
+            accumulated_bytes = 0;
+        } else if (!got_chunk) {
+            // No data received, wait a bit to avoid busy loop
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    // Send any remaining accumulated data
+    if (accumulated_bytes > 0 && s_output_cb) {
+        s_output_cb((const int16_t *)accumulation_buffer, accumulated_bytes / sizeof(int16_t), s_user_ctx);
     }
 
     // Drain remaining items from queue
@@ -71,6 +125,7 @@ static void output_task(void *arg)
         }
     }
 
+    free(accumulation_buffer);
     ESP_LOGI(TAG, "Output task exiting");
     s_output_task = NULL;
     vTaskDelete(NULL);
@@ -89,8 +144,8 @@ static void fetch_task(void *arg)
         afe_fetch_result_t *result = s_afe_handle->fetch(s_afe_data);
 
         if (result && result->data && result->data_size > 0) {
-            // Allocate buffer and copy data for queue
-            int16_t *chunk_data = heap_caps_malloc(result->data_size, MALLOC_CAP_INTERNAL);
+            // Allocate buffer and copy data for queue (use PSRAM, 8MB available)
+            int16_t *chunk_data = heap_caps_malloc(result->data_size, MALLOC_CAP_SPIRAM);
             if (chunk_data) {
                 memcpy(chunk_data, result->data, result->data_size);
 
@@ -144,11 +199,12 @@ bool audio_aec_init(audio_aec_output_cb_t output_cb, void *user_ctx)
     }
 
     // Customize AFE configuration for our use case
-    s_afe_config->aec_init = true;  // Enable AEC (Acoustic Echo Cancellation)
+    // Try with AGC enabled to boost weak mic signal
+    s_afe_config->aec_init = false;  // **DISABLED** AEC for testing
     s_afe_config->se_init = false;  // Disable SE (Speech Enhancement / Beamforming) - only 1 mic
-    s_afe_config->vad_init = true;  // Enable VAD (Voice Activity Detection)
-    s_afe_config->ns_init = true;   // Enable NS (Noise Suppression)
-    s_afe_config->agc_init = false; // Disable AGC - we control volume manually
+    s_afe_config->vad_init = false;  // **DISABLED** VAD for testing
+    s_afe_config->ns_init = false;  // Disable NS (Noise Suppression) - too CPU intensive
+    s_afe_config->agc_init = true;  // **ENABLED** AGC to boost weak microphone signal
 
     // Configure PCM settings (will be auto-filled by afe_config_init, but verify)
     ESP_LOGI(TAG, "PCM config: total_ch=%d, mic_num=%d, ref_num=%d, sample_rate=%d",
@@ -193,7 +249,7 @@ bool audio_aec_init(audio_aec_output_cb_t output_cb, void *user_ctx)
 
     // Allocate feed buffer for interleaved audio (total samples = total_feed_chunk)
     size_t feed_buffer_size = total_feed_chunk * sizeof(int16_t);
-    s_feed_buffer = heap_caps_malloc(feed_buffer_size, MALLOC_CAP_INTERNAL);
+    s_feed_buffer = malloc(feed_buffer_size);
     if (!s_feed_buffer) {
         ESP_LOGE(TAG, "Failed to allocate feed buffer (%zu bytes)", feed_buffer_size);
         s_afe_handle->destroy(s_afe_data);

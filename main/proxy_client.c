@@ -45,6 +45,10 @@ static bool s_ws_connected = false;
 static bool s_ws_receiving_audio = false;
 static size_t s_received_audio_bytes = 0;
 
+// User callbacks
+static proxy_ws_state_cb_t s_user_ws_state_cb = NULL;
+static void *s_user_ctx = NULL;
+
 static void *proxy_alloc(size_t size)
 {
     void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -118,6 +122,8 @@ static void ws_audio_received_handler(const uint8_t *data, size_t len, void *use
 
 static void ws_state_change_handler(bool connected, void *user_ctx)
 {
+    (void)user_ctx;
+
     s_ws_connected = connected;
     if (connected) {
         ESP_LOGI(TAG, "WebSocket connected to proxy");
@@ -125,10 +131,19 @@ static void ws_state_change_handler(bool connected, void *user_ctx)
         ESP_LOGW(TAG, "WebSocket disconnected from proxy");
         s_ws_receiving_audio = false;
     }
+
+    // Call user callback if registered
+    if (s_user_ws_state_cb) {
+        s_user_ws_state_cb(connected, s_user_ctx);
+    }
 }
 
-void proxy_client_init(proxy_speech_event_cb_t speech_cb, void *user_ctx)
+void proxy_client_init(proxy_ws_state_cb_t ws_state_cb, proxy_speech_event_cb_t speech_cb, void *user_ctx)
 {
+    // Store user callbacks
+    s_user_ws_state_cb = ws_state_cb;
+    s_user_ctx = user_ctx;
+
     load_or_create_session_id();
     ESP_LOGI(TAG, "Proxy client initialised using %s (session: %s)", s_config.url, s_config.session_id);
 

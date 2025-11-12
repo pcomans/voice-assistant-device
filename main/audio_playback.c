@@ -234,7 +234,7 @@ static void buffered_playback_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "Buffered playback task started on core %d", xPortGetCoreID());
 
-    uint8_t *read_buffer = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL);
+    uint8_t *read_buffer = malloc(4096);
     if (!read_buffer) {
         ESP_LOGE(TAG, "Failed to allocate read buffer for playback task");
         s_buffered_playback_task = NULL;

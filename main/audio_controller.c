@@ -16,7 +16,7 @@
 #define AUDIO_FRAME_SAMPLES      256
 
 // AEC configuration
-#define AEC_ENABLE               1     // Enable AEC processing
+#define AEC_ENABLE               0     // Disable AEC - bypass AFE entirely for debugging
 
 static const char *TAG = "audio_ctrl";
 
@@ -148,10 +148,10 @@ static void streaming_capture_task(void *arg)
     ESP_LOGI(TAG, "Using AEC chunk size: %zu samples/channel (%.1f ms @ 16kHz)",
              aec_chunk_size, (aec_chunk_size * 1000.0f) / 16000.0f);
 
-    // Allocate buffers
-    int32_t *i2s_buffer = heap_caps_malloc(AUDIO_FRAME_SAMPLES * sizeof(int32_t), MALLOC_CAP_INTERNAL);
-    int16_t *mic_buffer = heap_caps_malloc(aec_chunk_size * sizeof(int16_t), MALLOC_CAP_INTERNAL);
-    int16_t *ref_buffer = heap_caps_malloc(aec_chunk_size * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+    // Allocate buffers using regular malloc (defaults to internal RAM)
+    int32_t *i2s_buffer = malloc(AUDIO_FRAME_SAMPLES * sizeof(int32_t));
+    int16_t *mic_buffer = malloc(aec_chunk_size * sizeof(int16_t));
+    int16_t *ref_buffer = malloc(aec_chunk_size * sizeof(int16_t));
 
     if (!i2s_buffer || !mic_buffer || !ref_buffer) {
         ESP_LOGE(TAG, "Failed to allocate streaming buffers");
@@ -188,6 +188,17 @@ static void streaming_capture_task(void *arg)
 
         // When chunk is full, process through AEC
         if (samples_in_chunk >= aec_chunk_size) {
+            // Debug: Check raw mic level before AEC every 100 chunks
+            static int mic_debug_counter = 0;
+            if (mic_debug_counter++ % 100 == 0) {
+                int32_t sum = 0;
+                for (size_t i = 0; i < aec_chunk_size; i++) {
+                    sum += abs(mic_buffer[i]);
+                }
+                int16_t avg = sum / aec_chunk_size;
+                ESP_LOGI(TAG, "Raw mic BEFORE AEC: avg=%d", avg);
+            }
+
             // Get reference samples (playback audio for echo cancellation)
             audio_aec_reference_get(ref_buffer, aec_chunk_size);
 
@@ -211,9 +222,10 @@ static void streaming_capture_task(void *arg)
     free(ref_buffer);
 
 #else
-    // Original non-AEC path (fallback)
+    // Non-AEC path: Raw microphone with manual gain
     const size_t chunk_samples = 1600;  // 100ms @ 16kHz
     const size_t chunk_bytes = chunk_samples * sizeof(int16_t);
+    const int manual_gain = 10;  // 10x gain to boost weak microphone signal
 
     int32_t *i2s_buffer = malloc(chunk_samples * sizeof(int32_t));
     int16_t *pcm_chunk = malloc(chunk_bytes);
@@ -227,7 +239,10 @@ static void streaming_capture_task(void *arg)
         return;
     }
 
+    ESP_LOGI(TAG, "Non-AEC mode: Using raw microphone with %dx manual gain", manual_gain);
+
     size_t samples_in_chunk = 0;
+    int debug_counter = 0;
 
     while (streaming_capture_task_handle != NULL) {
         size_t bytes_read = 0;
@@ -241,11 +256,25 @@ static void streaming_capture_task(void *arg)
         size_t samples_read = bytes_read / sizeof(int32_t);
         for (size_t i = 0; i < samples_read; i++) {
             if (samples_in_chunk < chunk_samples) {
-                pcm_chunk[samples_in_chunk++] = (int16_t)(i2s_buffer[i] >> 14);
+                // Apply manual gain with clipping protection
+                int32_t sample = (int32_t)(i2s_buffer[i] >> 14) * manual_gain;
+                if (sample > 32767) sample = 32767;
+                if (sample < -32768) sample = -32768;
+                pcm_chunk[samples_in_chunk++] = (int16_t)sample;
             }
         }
 
         if (samples_in_chunk >= chunk_samples) {
+            // Debug: Log audio level every 100 chunks
+            if (debug_counter++ % 100 == 0) {
+                int32_t sum = 0;
+                for (size_t i = 0; i < chunk_samples; i++) {
+                    sum += abs(pcm_chunk[i]);
+                }
+                int16_t avg = sum / chunk_samples;
+                ESP_LOGI(TAG, "Raw mic with %dx gain: avg=%d", manual_gain, avg);
+            }
+
             if (s_chunk_cb) {
                 s_chunk_cb((const uint8_t *)pcm_chunk, chunk_bytes, s_chunk_ctx);
             }
@@ -273,8 +302,9 @@ void audio_start_streaming_capture(audio_capture_chunk_cb_t chunk_cb, void *ctx)
 
     ESP_LOGI(TAG, "Starting streaming audio capture (100ms chunks)");
     // Increased stack size for AEC processing (needs ~3KB for buffers + AEC overhead)
-    // Pin to core 1 (same as fetch task) and lower priority to avoid starving IDLE task
-    xTaskCreatePinnedToCore(streaming_capture_task, "audio_stream", 8192, NULL, 4, &streaming_capture_task_handle, 1);
+    // Pin to core 1 (same as fetch task) and very low priority to avoid starving IDLE task
+    // Priority 2: Lower than fetch (5) to ensure AFE drains quickly, but still responsive
+    xTaskCreatePinnedToCore(streaming_capture_task, "audio_stream", 8192, NULL, 2, &streaming_capture_task_handle, 1);
 }
 
 void audio_stop_streaming_capture(void)

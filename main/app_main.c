@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,6 +26,13 @@ static assistant_status_t g_status = {
     .wifi_connected = false,
     .proxy_connected = false,
 };
+
+// Microphone mute state (true = send silence, false = send real audio)
+static bool s_mic_muted = true;  // Start muted
+
+// Pre-allocated silence buffer for muting (allocated from PSRAM at startup)
+#define SILENCE_BUFFER_SIZE 4096
+static uint8_t *s_silence_buffer = NULL;
 
 // Forward declarations
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx);
@@ -137,13 +145,67 @@ static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, voi
     (void)ctx;
 
     // Forward AEC-cleaned audio chunks directly to WebSocket (16kHz)
-    // Proxy will resample to 24kHz for OpenAI
-    // AEC handles echo cancellation, so no manual mic muting needed
+    // When mic is muted, send silence instead of real audio
+    // This keeps the stream continuous for OpenAI Server VAD
     if (pcm_len > 0) {
-        esp_err_t err = ws_client_send_audio(pcm_data, pcm_len);
+        const uint8_t *data_to_send = pcm_data;
+        static int debug_counter = 0;
+
+        if (s_mic_muted && s_silence_buffer) {
+            // Use pre-allocated silence buffer from PSRAM
+            if (pcm_len <= SILENCE_BUFFER_SIZE) {
+                data_to_send = s_silence_buffer;
+            } else {
+                ESP_LOGW(TAG, "Chunk size %zu exceeds silence buffer, sending real audio", pcm_len);
+            }
+        } else if (!s_mic_muted && debug_counter++ % 100 == 0) {
+            // Debug: Check audio level every 100 chunks when unmuted
+            int16_t *samples = (int16_t *)pcm_data;
+            int32_t sum = 0;
+            for (size_t i = 0; i < pcm_len / 2; i++) {
+                sum += abs(samples[i]);
+            }
+            int16_t avg = sum / (pcm_len / 2);
+            ESP_LOGI(TAG, "Unmuted audio level: avg=%d, samples=%zu", avg, pcm_len / 2);
+        }
+
+        esp_err_t err = ws_client_send_audio(data_to_send, pcm_len);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Failed to send audio chunk: %s", esp_err_to_name(err));
         }
+    }
+}
+
+/**
+ * @brief WebSocket state change callback - starts continuous streaming
+ */
+static void websocket_connected_handler(bool connected, void *ctx)
+{
+    (void)ctx;
+
+    if (connected) {
+        ESP_LOGI(TAG, "WebSocket connected - starting continuous audio streaming");
+        g_status.proxy_connected = true;
+        ui_update_state(g_status);
+
+        // Start playback stream to receive OpenAI responses
+        if (!audio_playback_stream_start()) {
+            ESP_LOGE(TAG, "Failed to start playback stream");
+            return;
+        }
+
+        // Start continuous audio capture (will send silence when muted)
+        audio_start_streaming_capture(streaming_chunk_handler, NULL);
+        ESP_LOGI(TAG, "Continuous streaming started (mic muted by default)");
+
+    } else {
+        ESP_LOGW(TAG, "WebSocket disconnected - stopping continuous streaming");
+        g_status.proxy_connected = false;
+        ui_update_state(g_status);
+
+        // Stop streaming
+        audio_stop_streaming_capture();
+        audio_playback_stream_end();
     }
 }
 
@@ -153,37 +215,22 @@ static void ui_event_handler(const ui_event_t *event, void *ctx)
 
     switch (event->type) {
     case UI_EVENT_RECORD_START:
-        if (!assistant_get_status().wifi_connected) {
-            ESP_LOGW(TAG, "Cannot start streaming: Wi-Fi not connected");
+        if (!g_status.proxy_connected) {
+            ESP_LOGW(TAG, "Cannot unmute: WebSocket not connected");
             break;
         }
-        if (assistant_get_status().state == ASSISTANT_STATE_IDLE) {
-            ESP_LOGI(TAG, "Unmuting microphone - starting continuous streaming");
 
-            // Stop any previous playback stream and start fresh
-            audio_playback_stream_end();
-
-            // Start playback stream to receive OpenAI responses
-            if (!audio_playback_stream_start()) {
-                ESP_LOGE(TAG, "Failed to start playback stream");
-                break;
-            }
-
-            assistant_set_state(ASSISTANT_STATE_STREAMING);
-            audio_start_streaming_capture(streaming_chunk_handler, NULL);
-        }
+        ESP_LOGI(TAG, "Button pressed - unmuting microphone");
+        s_mic_muted = false;
+        assistant_set_state(ASSISTANT_STATE_STREAMING);
         break;
+
     case UI_EVENT_RECORD_STOP:
-        if (assistant_get_status().state == ASSISTANT_STATE_STREAMING) {
-            ESP_LOGI(TAG, "Muting microphone - stopping streaming");
-            assistant_set_state(ASSISTANT_STATE_IDLE);
-            audio_stop_streaming_capture();
-            // Final empty chunk will be sent by audio_controller.c
-
-            // Keep playback stream open to let assistant finish speaking
-            // It will be stopped when starting a new streaming session
-        }
+        ESP_LOGI(TAG, "Button released - muting microphone");
+        s_mic_muted = true;
+        assistant_set_state(ASSISTANT_STATE_IDLE);
         break;
+
     default:
         ESP_LOGW(TAG, "Unhandled UI event: %d", event->type);
         break;
@@ -206,6 +253,15 @@ static void lvgl_task(void *pvParameter)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    // Allocate silence buffer from PSRAM (not internal RAM to avoid display SPI conflicts)
+    s_silence_buffer = heap_caps_calloc(1, SILENCE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_silence_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate silence buffer from PSRAM!");
+    } else {
+        ESP_LOGI(TAG, "Allocated %d byte silence buffer from PSRAM", SILENCE_BUFFER_SIZE);
+    }
+
     initialise_wifi();
 
     ui_init(ui_event_handler, NULL);
@@ -213,7 +269,7 @@ void app_main(void)
     audio_playback_init();
     audio_playback_set_callback(playback_event_handler, NULL);
     audio_playback_set_reference_callback(playback_reference_handler, NULL);  // For AEC reference
-    proxy_client_init(NULL, NULL);  // No speech event handler needed with AEC
+    proxy_client_init(websocket_connected_handler, NULL, NULL);  // WebSocket callback for continuous streaming
     assistant_set_state(ASSISTANT_STATE_IDLE);
 
     // Create LVGL task to periodically update the display
