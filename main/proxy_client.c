@@ -47,6 +47,7 @@ static size_t s_received_audio_bytes = 0;
 
 // User callbacks
 static proxy_ws_state_cb_t s_user_ws_state_cb = NULL;
+static proxy_audio_received_cb_t s_user_audio_cb = NULL;
 static void *s_user_ctx = NULL;
 
 static void *proxy_alloc(size_t size)
@@ -112,11 +113,16 @@ generate_new:
 // WebSocket callbacks
 static void ws_audio_received_handler(const uint8_t *data, size_t len, void *user_ctx)
 {
-    // Stream audio directly to playback (always enabled in continuous streaming mode)
-    if (audio_playback_stream_write(data, len)) {
-        ESP_LOGD(TAG, "Streamed %zu bytes to playback", len);
+    // Call user audio callback if registered
+    if (s_user_audio_cb) {
+        s_user_audio_cb(data, len, s_user_ctx);
     } else {
-        ESP_LOGW(TAG, "Ring buffer full, dropped %zu bytes", len);
+        // Fallback: Stream audio directly to playback
+        if (audio_playback_stream_write(data, len)) {
+            ESP_LOGD(TAG, "Streamed %zu bytes to playback", len);
+        } else {
+            ESP_LOGW(TAG, "Ring buffer full, dropped %zu bytes", len);
+        }
     }
 }
 
@@ -138,10 +144,11 @@ static void ws_state_change_handler(bool connected, void *user_ctx)
     }
 }
 
-void proxy_client_init(proxy_ws_state_cb_t ws_state_cb, proxy_speech_event_cb_t speech_cb, void *user_ctx)
+void proxy_client_init(proxy_ws_state_cb_t ws_state_cb, proxy_audio_received_cb_t audio_cb, proxy_speech_event_cb_t speech_cb, void *user_ctx)
 {
     // Store user callbacks
     s_user_ws_state_cb = ws_state_cb;
+    s_user_audio_cb = audio_cb;
     s_user_ctx = user_ctx;
 
     load_or_create_session_id();

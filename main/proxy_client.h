@@ -29,13 +29,23 @@ typedef void (*proxy_speech_event_cb_t)(bool is_speaking, void *user_ctx);
 typedef void (*proxy_ws_state_cb_t)(bool connected, void *user_ctx);
 
 /**
+ * @brief Callback for audio data received from OpenAI
+ *
+ * @param audio_data PCM audio data
+ * @param audio_len Length of audio data in bytes
+ * @param user_ctx User context pointer
+ */
+typedef void (*proxy_audio_received_cb_t)(const uint8_t *audio_data, size_t audio_len, void *user_ctx);
+
+/**
  * @brief Initialize proxy client
  *
  * @param ws_state_cb Callback for WebSocket connection state (can be NULL)
+ * @param audio_cb Callback for audio data received (can be NULL)
  * @param speech_cb Callback for assistant speech events (can be NULL)
  * @param user_ctx User context passed to callbacks
  */
-void proxy_client_init(proxy_ws_state_cb_t ws_state_cb, proxy_speech_event_cb_t speech_cb, void *user_ctx);
+void proxy_client_init(proxy_ws_state_cb_t ws_state_cb, proxy_audio_received_cb_t audio_cb, proxy_speech_event_cb_t speech_cb, void *user_ctx);
 
 // Connect to proxy (call after WiFi is connected)
 void proxy_client_connect(void);

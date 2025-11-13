@@ -13,6 +13,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,12 +27,17 @@ static assistant_status_t g_status = {
     .proxy_connected = false,
 };
 
-// Microphone mute state (true = send silence, false = send real audio)
-static bool s_mic_muted = true;  // Start muted
+// Microphone control state
+static bool s_user_wants_mic_on = false;  // User button state (pressed/released)
 
 // Pre-allocated silence buffer for muting (allocated from PSRAM at startup)
 #define SILENCE_BUFFER_SIZE 4096
 static uint8_t *s_silence_buffer = NULL;
+
+// Track when AI is speaking based on audio reception
+static int64_t s_last_audio_received_us = 0;
+static bool s_was_muted_by_ai = false;  // Track auto-mute state changes
+#define AI_SPEAKING_TIMEOUT_MS 2000  // Keep mic muted for 2s after last audio received (accounts for 500ms pre-buffer + 1500ms safety)
 
 // Forward declarations
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx);
@@ -42,11 +48,10 @@ static void playback_event_handler(audio_playback_event_t event, void *ctx)
 
     switch (event) {
     case AUDIO_PLAYBACK_EVENT_STARTED:
-        ESP_LOGI(TAG, "Playback started");
+        ESP_LOGI(TAG, "Playback stream started");
         break;
     case AUDIO_PLAYBACK_EVENT_COMPLETED:
-        ESP_LOGI(TAG, "Playback completed");
-        // No state change needed - can stay in STREAMING if mic still unmuted
+        ESP_LOGI(TAG, "Playback stream completed");
         break;
     case AUDIO_PLAYBACK_EVENT_ERROR:
         ESP_LOGE(TAG, "Playback error");
@@ -126,21 +131,40 @@ static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, voi
 {
     (void)ctx;
 
-    // Forward AEC-cleaned audio chunks directly to WebSocket (16kHz)
-    // When mic is muted, send silence instead of real audio
-    // This keeps the stream continuous for OpenAI Server VAD
+    // Forward audio chunks to WebSocket (16kHz)
+    // Auto-mute when AI is speaking (detected by audio reception)
+    // Send silence when muted, real audio when unmuted
     if (pcm_len > 0) {
         const uint8_t *data_to_send = pcm_data;
         static int debug_counter = 0;
 
-        if (s_mic_muted && s_silence_buffer) {
+        // Check if AI is currently speaking (received audio recently)
+        int64_t now_us = esp_timer_get_time();
+        int64_t time_since_audio_ms = (now_us - s_last_audio_received_us) / 1000;
+        bool ai_is_speaking = (time_since_audio_ms < AI_SPEAKING_TIMEOUT_MS);
+
+        // Mute if: (1) User hasn't enabled mic, OR (2) AI is speaking
+        bool should_mute = !s_user_wants_mic_on || ai_is_speaking;
+
+        // Log state changes for auto-mute
+        if (s_user_wants_mic_on) {
+            if (ai_is_speaking && !s_was_muted_by_ai) {
+                ESP_LOGI(TAG, "Auto-muting mic (AI speaking, %lld ms since last audio)", time_since_audio_ms);
+                s_was_muted_by_ai = true;
+            } else if (!ai_is_speaking && s_was_muted_by_ai) {
+                ESP_LOGI(TAG, "Auto-unmuting mic (AI finished, %lld ms since last audio)", time_since_audio_ms);
+                s_was_muted_by_ai = false;
+            }
+        }
+
+        if (should_mute && s_silence_buffer) {
             // Use pre-allocated silence buffer from PSRAM
             if (pcm_len <= SILENCE_BUFFER_SIZE) {
                 data_to_send = s_silence_buffer;
             } else {
                 ESP_LOGW(TAG, "Chunk size %zu exceeds silence buffer, sending real audio", pcm_len);
             }
-        } else if (!s_mic_muted && debug_counter++ % 100 == 0) {
+        } else if (!should_mute && debug_counter++ % 100 == 0) {
             // Debug: Check audio level every 100 chunks when unmuted
             int16_t *samples = (int16_t *)pcm_data;
             int32_t sum = 0;
@@ -148,7 +172,7 @@ static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, voi
                 sum += abs(samples[i]);
             }
             int16_t avg = sum / (pcm_len / 2);
-            ESP_LOGI(TAG, "Unmuted audio level: avg=%d, samples=%zu", avg, pcm_len / 2);
+            ESP_LOGI(TAG, "Mic active, audio level: avg=%d, samples=%zu", avg, pcm_len / 2);
         }
 
         esp_err_t err = ws_client_send_audio(data_to_send, pcm_len);
@@ -191,6 +215,26 @@ static void websocket_connected_handler(bool connected, void *ctx)
     }
 }
 
+static void audio_received_handler(const uint8_t *audio_data, size_t audio_len, void *ctx)
+{
+    (void)ctx;
+
+    static int audio_chunk_count = 0;
+
+    // Update timestamp - AI is speaking
+    s_last_audio_received_us = esp_timer_get_time();
+
+    // Log occasionally to show AI audio is being received
+    if (audio_chunk_count++ % 50 == 0) {
+        ESP_LOGI(TAG, "AI audio received (%d bytes, chunk #%d)", (int)audio_len, audio_chunk_count);
+    }
+
+    // Forward to playback
+    if (audio_len > 0) {
+        audio_playback_stream_write(audio_data, audio_len);
+    }
+}
+
 static void ui_event_handler(const ui_event_t *event, void *ctx)
 {
     (void)ctx;
@@ -198,18 +242,18 @@ static void ui_event_handler(const ui_event_t *event, void *ctx)
     switch (event->type) {
     case UI_EVENT_RECORD_START:
         if (!g_status.proxy_connected) {
-            ESP_LOGW(TAG, "Cannot unmute: WebSocket not connected");
+            ESP_LOGW(TAG, "Cannot enable mic: WebSocket not connected");
             break;
         }
 
-        ESP_LOGI(TAG, "Button pressed - unmuting microphone");
-        s_mic_muted = false;
+        ESP_LOGI(TAG, "Button pressed - enabling microphone");
+        s_user_wants_mic_on = true;
         assistant_set_state(ASSISTANT_STATE_STREAMING);
         break;
 
     case UI_EVENT_RECORD_STOP:
-        ESP_LOGI(TAG, "Button released - muting microphone");
-        s_mic_muted = true;
+        ESP_LOGI(TAG, "Button released - disabling microphone");
+        s_user_wants_mic_on = false;
         assistant_set_state(ASSISTANT_STATE_IDLE);
         break;
 
@@ -250,7 +294,7 @@ void app_main(void)
     audio_controller_init();
     audio_playback_init();
     audio_playback_set_callback(playback_event_handler, NULL);
-    proxy_client_init(websocket_connected_handler, NULL, NULL);  // WebSocket callback for continuous streaming
+    proxy_client_init(websocket_connected_handler, audio_received_handler, NULL, NULL);  // WebSocket callbacks for continuous streaming
     assistant_set_state(ASSISTANT_STATE_IDLE);
 
     // Create LVGL task to periodically update the display
