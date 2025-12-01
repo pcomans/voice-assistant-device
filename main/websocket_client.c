@@ -16,6 +16,7 @@ static ws_speech_event_cb_t s_speech_cb = NULL;
 static void *s_user_ctx = NULL;
 static bool s_connected = false;
 static SemaphoreHandle_t s_state_mutex = NULL;
+static uint16_t s_last_close_code = 0;
 
 /**
  * @brief WebSocket event handler
@@ -32,7 +33,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         xSemaphoreGive(s_state_mutex);
 
         if (s_state_cb) {
-            s_state_cb(true, s_user_ctx);
+            s_state_cb(true, 0, s_user_ctx);  // 0 for connected
         }
         break;
 
@@ -43,8 +44,9 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         xSemaphoreGive(s_state_mutex);
 
         if (s_state_cb) {
-            s_state_cb(false, s_user_ctx);
+            s_state_cb(false, s_last_close_code, s_user_ctx);
         }
+        s_last_close_code = 0;  // Reset after passing to callback
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -85,7 +87,42 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 }
             }
         } else if (data->op_code == 0x08) {  // Close frame
-            ESP_LOGD(TAG, "Received WebSocket close frame");
+            uint16_t close_code = 0;
+            const char *close_reason = "";
+            int reason_len = 0;
+
+            if (data->data_ptr && data->data_len >= 2) {
+                // Extract close code (first 2 bytes, network byte order)
+                close_code = (((uint16_t)data->data_ptr[0]) << 8) | ((uint16_t)data->data_ptr[1]);
+                s_last_close_code = close_code;
+
+                // Extract close reason (remaining bytes)
+                if (data->data_len > 2) {
+                    close_reason = (const char *)(data->data_ptr + 2);
+                    reason_len = data->data_len - 2;
+                }
+            }
+
+            if (close_code == 1000) {
+                ESP_LOGI(TAG, "WebSocket close: Normal closure (code=%d, reason='%.*s')",
+                         close_code, reason_len, close_reason);
+            } else {
+                ESP_LOGW(TAG, "WebSocket Error: code=%d, reason='%.*s')",
+                         close_code, reason_len, close_reason);
+            }
+
+            // Update connected state and call disconnect callback immediately
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            s_connected = false;
+            xSemaphoreGive(s_state_mutex);
+
+            // Call state callback immediately with close code
+            if (s_state_cb) {
+                s_state_cb(false, close_code, s_user_ctx);
+            }
+
+            // Reset close code after callback (will be 0 if DISCONNECTED event fires later)
+            s_last_close_code = 0;
         } else if (data->op_code == 0x09) {  // Ping frame
             ESP_LOGD(TAG, "Received WebSocket ping frame");
         } else if (data->op_code == 0x0a) {  // Pong frame
@@ -148,7 +185,7 @@ esp_err_t ws_client_init(const char *uri,
         .buffer_size = 4096,  // Larger buffer for audio chunks
         .task_stack = 8192,   // Increased stack for audio processing
         .task_prio = 5,
-        .disable_auto_reconnect = false,  // Enable auto-reconnect
+        .disable_auto_reconnect = true,   // Disable auto-reconnect for explicit state control
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms = 10000,
         .ping_interval_sec = 10,

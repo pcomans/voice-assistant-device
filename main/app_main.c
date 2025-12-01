@@ -41,6 +41,7 @@ static bool s_was_muted_by_ai = false;  // Track auto-mute state changes
 
 // Forward declarations
 static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, void *ctx);
+static void websocket_connected_handler(bool connected, uint16_t close_code, void *ctx);
 
 static void playback_event_handler(audio_playback_event_t event, void *ctx)
 {
@@ -176,8 +177,26 @@ static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, voi
         }
 
         esp_err_t err = ws_client_send_audio(data_to_send, pcm_len);
+        static int consecutive_errors = 0;
+
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send audio chunk: %s", esp_err_to_name(err));
+            consecutive_errors++;
+            if (consecutive_errors > 3) {
+                // Check if WebSocket is already disconnected (close frame received)
+                // If so, don't force - let natural DISCONNECTED event handle it with proper close code
+                if (ws_client_is_connected()) {
+                    ESP_LOGE(TAG, "Too many send errors (%d), forcing disconnect", consecutive_errors);
+                    // Force disconnect for abnormal errors (no close code received yet)
+                    websocket_connected_handler(false, 0, NULL);
+                } else {
+                    ESP_LOGI(TAG, "Send errors detected but WebSocket already closing, waiting for DISCONNECTED event");
+                }
+                consecutive_errors = 0;
+            } else {
+                ESP_LOGW(TAG, "Failed to send audio chunk: %s", esp_err_to_name(err));
+            }
+        } else {
+            consecutive_errors = 0;  // Reset on success
         }
     }
 }
@@ -185,7 +204,7 @@ static void streaming_chunk_handler(const uint8_t *pcm_data, size_t pcm_len, voi
 /**
  * @brief WebSocket state change callback - starts continuous streaming
  */
-static void websocket_connected_handler(bool connected, void *ctx)
+static void websocket_connected_handler(bool connected, uint16_t close_code, void *ctx)
 {
     (void)ctx;
 
@@ -205,13 +224,27 @@ static void websocket_connected_handler(bool connected, void *ctx)
         ESP_LOGI(TAG, "Continuous streaming started (mic muted by default)");
 
     } else {
-        ESP_LOGW(TAG, "WebSocket disconnected - stopping continuous streaming");
+        ESP_LOGW(TAG, "WebSocket disconnected (code=%d) - stopping continuous streaming", close_code);
         g_status.proxy_connected = false;
-        ui_update_state(g_status);
+
+        // Reset mic state - user must explicitly re-enable after disconnect
+        s_user_wants_mic_on = false;
 
         // Stop streaming
         audio_stop_streaming_capture();
         audio_playback_stream_end();
+
+        // Determine state based on close code
+        if (close_code == 1000) {
+            // Normal closure (timeout) - go to IDLE, user can tap button to reconnect
+            assistant_set_state(ASSISTANT_STATE_IDLE);
+            ESP_LOGI(TAG, "Session ended due to timeout - tap button to start new conversation");
+        } else {
+            // Abnormal closure - go to ERROR state
+            assistant_set_state(ASSISTANT_STATE_ERROR);
+            ESP_LOGE(TAG, "Connection error (code=%d) - showing error state", close_code);
+            // User must tap button to clear error and reconnect
+        }
     }
 }
 
@@ -242,7 +275,11 @@ static void ui_event_handler(const ui_event_t *event, void *ctx)
     switch (event->type) {
     case UI_EVENT_RECORD_START:
         if (!g_status.proxy_connected) {
-            ESP_LOGW(TAG, "Cannot enable mic: WebSocket not connected");
+            ESP_LOGI(TAG, "Button pressed while disconnected - reconnecting...");
+            proxy_client_connect();
+            // Connection will trigger websocket_connected_handler which starts streaming
+            // Then we'll enable the mic once connected
+            s_user_wants_mic_on = true;
             break;
         }
 

@@ -24,9 +24,10 @@ typedef void (*proxy_speech_event_cb_t)(bool is_speaking, void *user_ctx);
  * @brief Callback for WebSocket connection state changes
  *
  * @param connected true when WebSocket connects, false when it disconnects
+ * @param close_code WebSocket close code (0 if connected, RFC 6455 code if disconnected)
  * @param user_ctx User context pointer
  */
-typedef void (*proxy_ws_state_cb_t)(bool connected, void *user_ctx);
+typedef void (*proxy_ws_state_cb_t)(bool connected, uint16_t close_code, void *user_ctx);
 
 /**
  * @brief Callback for audio data received from OpenAI

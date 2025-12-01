@@ -126,7 +126,7 @@ static void ws_audio_received_handler(const uint8_t *data, size_t len, void *use
     }
 }
 
-static void ws_state_change_handler(bool connected, void *user_ctx)
+static void ws_state_change_handler(bool connected, uint16_t close_code, void *user_ctx)
 {
     (void)user_ctx;
 
@@ -134,13 +134,13 @@ static void ws_state_change_handler(bool connected, void *user_ctx)
     if (connected) {
         ESP_LOGI(TAG, "WebSocket connected to proxy");
     } else {
-        ESP_LOGW(TAG, "WebSocket disconnected from proxy");
+        ESP_LOGW(TAG, "WebSocket disconnected from proxy (code=%d)", close_code);
         s_ws_receiving_audio = false;
     }
 
     // Call user callback if registered
     if (s_user_ws_state_cb) {
-        s_user_ws_state_cb(connected, s_user_ctx);
+        s_user_ws_state_cb(connected, close_code, s_user_ctx);
     }
 }
 
