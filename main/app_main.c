@@ -98,8 +98,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         assistant_set_wifi_connected(true);
 
-        // WiFi is ready, connect to proxy
-        proxy_client_connect();
+        // Note: WebSocket connection deferred until user presses button
+        ESP_LOGI(TAG, "WiFi ready - waiting for user to start conversation");
     }
 }
 
