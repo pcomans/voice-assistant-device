@@ -15,10 +15,11 @@
 
 #include "smart_assistant.h"
 #include "websocket_client.h"
+#include "wifi_credentials.h"
 
 static const char *TAG = "proxy_client";
 
-#define PROXY_DEFAULT_URL   "ws://192.168.7.75:8000/ws"
+#define PROXY_DEFAULT_URL   WEBSOCKET_URL
 
 #define PROXY_DEFAULT_TOKEN "498b1b65-26a3-49e8-a55e-46a0b47365e2"
 

@@ -119,24 +119,13 @@ Edit `main/wifi_credentials.h`:
 ```c
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WEBSOCKET_URL "ws://YOUR_SERVER_IP:8000/ws"
 ```
 
 **Important:**
 - ESP32-S3 only supports 2.4GHz WiFi networks
 - `wifi_credentials.h` is gitignored to protect your credentials
-
-### 2. Proxy Server Address
-
-Edit `main/proxy_client.c` and update the proxy URL with your proxy server's local IP address:
-
-```c
-#define PROXY_DEFAULT_URL   "ws://YOUR_PROXY_IP:8000/ws"
-```
-
-**Example:** If your proxy is running on `192.168.1.100`:
-```c
-#define PROXY_DEFAULT_URL   "ws://192.168.1.100:8000/ws"
-```
+- `WEBSOCKET_URL` is required and replaces the old hardcoded proxy configuration
 
 **Finding your proxy IP:**
 - **macOS/Linux**: `ifconfig | grep "inet " | grep -v 127.0.0.1`
